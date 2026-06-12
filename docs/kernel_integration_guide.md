@@ -97,7 +97,50 @@ embedding application can pass already-constructed model, tool, context,
 permission, memory, persistence, agent/coordinator, and observability services.
 Raygent does not silently enable advanced capabilities or choose product policy.
 
-Factory profiles are explicit:
+For common product construction paths, use a preset:
+
+```python
+from raygent_harness.sdk import create_raygent
+
+session = create_raygent(
+    provider=my_model_provider,
+    model="demo-model",
+    cwd=".",
+    preset="project_reader",
+)
+```
+
+Presets are documented compositions over the same factory options. Inspect them
+before use when policy matters:
+
+```python
+from raygent_harness.sdk import describe_raygent_preset, resolve_raygent_preset
+
+description = describe_raygent_preset("repo_maintainer")
+resolved = resolve_raygent_preset("repo_maintainer")
+```
+
+Supported presets are:
+
+- `minimal`
+- `chat`
+- `embedded_app`
+- `project_reader`
+- `code_review`
+- `repo_maintainer`
+- `research_agent`
+- `memory_agent`
+- `long_running_task`
+- `full_developer`
+
+Use `RaygentPresetOptions` for local storage roots and explicit safety
+acknowledgements. `memory_agent` requires caller-provided `RaygentMemoryOptions`.
+`repo_maintainer` installs project file tools, so it requires filesystem
+mutation acknowledgement plus an explicit permission surface. `full_developer`
+requires explicit permission options and acknowledgements for broad filesystem,
+shell, agent, MCP, and worktree authority.
+
+Low-level factory profiles are explicit:
 
 - `tools="none"` installs no SDK-owned tools.
 - `tools="file"` installs file `Read`/`Write`/`Edit`/`NotebookEdit`.
@@ -117,6 +160,7 @@ See:
 - `examples/project_profile.py`: conservative project profile.
 - `examples/reusable_factory.py`: reusable factory and product-wrapper pattern.
 - `examples/sdk_callbacks.py`: callback and kernel-event handling.
+- `recipes/create_raygent/`: copyable preset construction recipes.
 
 ## Low-Level Runtime Pieces
 

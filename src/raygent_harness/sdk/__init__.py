@@ -13,7 +13,7 @@ import contextlib
 import inspect
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
@@ -34,6 +34,17 @@ from raygent_harness.core.permissions import (
 from raygent_harness.core.query_engine import QueryEngine, SDKMessage, SDKResult
 from raygent_harness.core.task import AppStateStore
 from raygent_harness.core.tool import QueryTracking, Tool, ToolUseContext
+from raygent_harness.sdk.profiles import (
+    RaygentOverlay,
+    RaygentPreset,
+    RaygentPresetCompatibilityError,
+    RaygentPresetDescription,
+    RaygentPresetOptions,
+    RaygentPresetResolution,
+    describe_raygent_preset,
+    list_raygent_presets,
+    resolve_raygent_preset,
+)
 
 if TYPE_CHECKING:
     from raygent_harness.context_providers.environment import (
@@ -385,6 +396,9 @@ class RaygentFactoryConfig:
     persistence_options: RaygentPersistenceOptions | None = None
     agent_options: RaygentAgentOptions | None = None
     observability_options: RaygentObservabilityOptions | None = None
+    preset: RaygentPreset | str | None = None
+    overlays: tuple[RaygentOverlay | str, ...] = ()
+    preset_options: RaygentPresetOptions | None = None
 
 
 @dataclass
@@ -658,6 +672,7 @@ class RaygentFactory:
     ) -> RaygentSession:
         """Create a headless Raygent session from provider-neutral config."""
 
+        config = _apply_preset_config(config)
         settings = _resolve_factory_settings(config)
         runtime_root = Path(settings.cwd).expanduser().resolve()
         resolved_session_id = settings.session_id or f"raygent-{uuid.uuid4().hex}"
@@ -788,6 +803,9 @@ def create_raygent(
     persistence_options: RaygentPersistenceOptions | None = None,
     agent_options: RaygentAgentOptions | None = None,
     observability_options: RaygentObservabilityOptions | None = None,
+    preset: RaygentPreset | str | None = None,
+    overlays: tuple[RaygentOverlay | str, ...] = (),
+    preset_options: RaygentPresetOptions | None = None,
     cwd: str | Path = ".",
     session_id: str | None = None,
     system_prompt: str = "",
@@ -825,6 +843,9 @@ def create_raygent(
         persistence_options=persistence_options,
         agent_options=agent_options,
         observability_options=observability_options,
+        preset=preset,
+        overlays=overlays,
+        preset_options=preset_options,
         cwd=cwd,
         session_id=session_id,
         system_prompt=system_prompt,
@@ -864,6 +885,9 @@ def _coerce_factory_config(
     persistence_options: RaygentPersistenceOptions | None,
     agent_options: RaygentAgentOptions | None,
     observability_options: RaygentObservabilityOptions | None,
+    preset: RaygentPreset | str | None,
+    overlays: tuple[RaygentOverlay | str, ...],
+    preset_options: RaygentPresetOptions | None,
     cwd: str | Path,
     session_id: str | None,
     system_prompt: str,
@@ -899,6 +923,9 @@ def _coerce_factory_config(
             persistence_options=persistence_options,
             agent_options=agent_options,
             observability_options=observability_options,
+            preset=preset,
+            overlays=overlays,
+            preset_options=preset_options,
             cwd=cwd,
             session_id=session_id,
             system_prompt=system_prompt,
@@ -946,6 +973,9 @@ def _coerce_factory_config(
         persistence_options=persistence_options,
         agent_options=agent_options,
         observability_options=observability_options,
+        preset=preset,
+        overlays=overlays,
+        preset_options=preset_options,
         cwd=cwd,
         session_id=session_id,
         system_prompt=system_prompt,
@@ -968,6 +998,143 @@ def _coerce_factory_config(
         notify=notify,
         experiments=experiments or {},
     )
+
+
+def _apply_preset_config(config: RaygentFactoryConfig) -> RaygentFactoryConfig:
+    if config.preset is None:
+        if config.overlays:
+            raise ValueError("Raygent overlays require a preset.")
+        return config
+
+    preset_options = config.preset_options or RaygentPresetOptions()
+    if preset_options.project_root is None:
+        preset_options = replace(
+            preset_options,
+            project_root=_preset_project_root(config),
+        )
+    resolution = resolve_raygent_preset(
+        config.preset,
+        overlays=config.overlays,
+        options=preset_options,
+    )
+    if "memory_options" in resolution.required_options and config.memory_options is None:
+        raise ValueError(
+            f"Raygent preset {config.preset!r} requires RaygentMemoryOptions."
+        )
+    if (
+        resolution.requires_explicit_permission_options
+        and not _has_explicit_permission_options(config)
+    ):
+        raise ValueError(
+            f"Raygent preset {config.preset!r} requires explicit permission options, "
+            "permission_context, permission_handler, or non-interactive policy."
+        )
+
+    kwargs = resolution.factory_kwargs
+    tools = config.tools
+    if not _has_option_tools(config):
+        tools = _preset_default(
+            config.tools,
+            default="none",
+            value=kwargs.get("tools"),
+        )
+    context = config.context
+    if not _has_option_context(config):
+        context = _preset_default(
+            config.context,
+            default="none",
+            value=kwargs.get("context"),
+        )
+    transcript_store = config.transcript_store
+    if not _has_option_transcript_store(config):
+        transcript_store = _preset_optional(
+            config.transcript_store,
+            kwargs.get("transcript_store"),
+        )
+    task_output_dir = config.task_output_dir
+    if not _has_option_task_output_dir(config):
+        task_output_dir = _preset_optional(
+            config.task_output_dir,
+            kwargs.get("task_output_dir"),
+        )
+    tool_profile_options = config.tool_profile_options
+    tool_options = config.tool_options
+    if resolution.enable_bash:
+        if (
+            tool_profile_options == RaygentToolProfileOptions()
+            and tool_options is not None
+            and tool_options.profile_options is not None
+        ):
+            tool_options = replace(
+                tool_options,
+                profile_options=replace(
+                    tool_options.profile_options,
+                    enable_bash=True,
+                ),
+            )
+        else:
+            tool_profile_options = replace(tool_profile_options, enable_bash=True)
+
+    return replace(
+        config,
+        tools=tools,
+        context=context,
+        transcript_store=transcript_store,
+        task_output_dir=task_output_dir,
+        tool_profile_options=tool_profile_options,
+        tool_options=tool_options,
+    )
+
+
+def _preset_project_root(config: RaygentFactoryConfig) -> str | Path:
+    if config.cwd != ".":
+        return config.cwd
+    if config.session_options is not None and config.session_options.cwd is not None:
+        return config.session_options.cwd
+    return config.cwd
+
+
+def _has_explicit_permission_options(config: RaygentFactoryConfig) -> bool:
+    return (
+        config.permission_options is not None
+        or config.permission_context is not None
+        or config.permission_handler is not None
+        or config.is_non_interactive_session
+    )
+
+
+def _has_option_tools(config: RaygentFactoryConfig) -> bool:
+    return config.tool_options is not None and config.tool_options.tools is not None
+
+
+def _has_option_context(config: RaygentFactoryConfig) -> bool:
+    return config.context_options is not None and config.context_options.context is not None
+
+
+def _has_option_transcript_store(config: RaygentFactoryConfig) -> bool:
+    return (
+        config.persistence_options is not None
+        and config.persistence_options.transcript_store is not None
+    )
+
+
+def _has_option_task_output_dir(config: RaygentFactoryConfig) -> bool:
+    return (
+        config.persistence_options is not None
+        and config.persistence_options.task_output_dir is not None
+    )
+
+
+def _preset_optional[ValueT](current: ValueT | None, value: object) -> ValueT | None:
+    if current is not None:
+        return current
+    return cast(ValueT | None, value)
+
+
+def _preset_default[ValueT](current: ValueT, *, default: ValueT, value: object) -> ValueT:
+    if current != default or value is None:
+        return current
+    return cast(ValueT, value)
 
 
 def _resolve_factory_settings(config: RaygentFactoryConfig) -> _ResolvedFactorySettings:
@@ -1231,6 +1398,9 @@ def _config_override_names(
     persistence_options: RaygentPersistenceOptions | None,
     agent_options: RaygentAgentOptions | None,
     observability_options: RaygentObservabilityOptions | None,
+    preset: RaygentPreset | str | None,
+    overlays: tuple[RaygentOverlay | str, ...],
+    preset_options: RaygentPresetOptions | None,
     cwd: str | Path,
     session_id: str | None,
     system_prompt: str,
@@ -1276,6 +1446,12 @@ def _config_override_names(
         names.append("agent_options")
     if observability_options is not None:
         names.append("observability_options")
+    if preset is not None:
+        names.append("preset")
+    if overlays:
+        names.append("overlays")
+    if preset_options is not None:
+        names.append("preset_options")
     if cwd != ".":
         names.append("cwd")
     if session_id is not None:
@@ -1581,8 +1757,14 @@ __all__ = [
     "RaygentMemoryOptions",
     "RaygentModelOptions",
     "RaygentObservabilityOptions",
+    "RaygentOverlay",
     "RaygentPermissionOptions",
     "RaygentPersistenceOptions",
+    "RaygentPreset",
+    "RaygentPresetCompatibilityError",
+    "RaygentPresetDescription",
+    "RaygentPresetOptions",
+    "RaygentPresetResolution",
     "RaygentRunCallbacks",
     "RaygentRuntimeHandles",
     "RaygentSDKError",
@@ -1599,4 +1781,7 @@ __all__ = [
     "RaygentToolProfileOptions",
     "RaygentToolSelection",
     "create_raygent",
+    "describe_raygent_preset",
+    "list_raygent_presets",
+    "resolve_raygent_preset",
 ]

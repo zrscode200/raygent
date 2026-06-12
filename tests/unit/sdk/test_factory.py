@@ -70,6 +70,7 @@ from raygent_harness.sdk import (
     RaygentObservabilityOptions,
     RaygentPermissionOptions,
     RaygentPersistenceOptions,
+    RaygentPresetOptions,
     RaygentRunCallbacks,
     RaygentRuntimeHandles,
     RaygentSDKProtocolError,
@@ -106,6 +107,7 @@ from raygent_harness.tools import (
     TOOL_SEARCH_TOOL_NAME,
 )
 from raygent_harness.tools.bash_tool import BashInput
+from raygent_harness.tools.search_backend import SearchBackend
 from tests.fakes import FakeModelProvider
 
 
@@ -185,6 +187,221 @@ async def _turn_tools(session: RaygentSession) -> tuple[str, ...]:
     if tools is None:
         tools = session.config.tools
     return tuple(tool.name for tool in tools)
+
+
+def test_create_raygent_without_preset_keeps_safe_defaults(tmp_path: Path) -> None:
+    session = create_raygent(
+        provider=_provider(),
+        model="demo-model",
+        cwd=tmp_path,
+    )
+
+    assert session.config.tools == ()
+    assert session.deps.context_providers == ()
+    assert session.transcript_store is None
+    assert session.deps.memory_prompt_provider is None
+
+
+def test_chat_preset_adds_transcript_store_under_cwd(tmp_path: Path) -> None:
+    session = create_raygent(
+        provider=_provider(),
+        model="demo-model",
+        cwd=tmp_path,
+        session_id="chat-session",
+        preset="chat",
+    )
+
+    assert isinstance(session.transcript_store, JsonlTranscriptStore)
+    assert session.transcript_store.base_dir == (
+        tmp_path / ".raygent" / "transcripts"
+    ).resolve()
+    assert session.config.tools == ()
+    assert session.deps.context_providers == ()
+
+
+def test_chat_preset_uses_session_options_cwd_for_transcript_store(
+    tmp_path: Path,
+) -> None:
+    session = RaygentFactory().create_session(
+        RaygentFactoryConfig(
+            provider=_provider(),
+            model="demo-model",
+            session_options=RaygentSessionOptions(cwd=tmp_path),
+            preset="chat",
+        )
+    )
+
+    assert isinstance(session.transcript_store, JsonlTranscriptStore)
+    assert session.transcript_store.base_dir == (
+        tmp_path / ".raygent" / "transcripts"
+    ).resolve()
+    assert session.cwd == str(tmp_path.resolve())
+
+
+@pytest.mark.asyncio
+async def test_project_reader_preset_uses_readonly_project_tools(tmp_path: Path) -> None:
+    session = create_raygent(
+        provider=_provider(),
+        model="demo-model",
+        cwd=tmp_path,
+        preset="project_reader",
+    )
+
+    assert await _turn_tools(session) == ("Read", "Glob", "Grep", "ToolSearch")
+    assert any(
+        context_provider_kind(provider_obj) == "project_instructions"
+        for provider_obj in session.deps.context_providers
+    )
+
+
+def test_memory_agent_preset_requires_memory_options(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires RaygentMemoryOptions"):
+        create_raygent(
+            provider=_provider(),
+            model="demo-model",
+            cwd=tmp_path,
+            preset="memory_agent",
+        )
+
+
+def test_memory_agent_preset_wires_memory_options(tmp_path: Path) -> None:
+    memory_recall = cast(MemoryRecallProvider, object())
+    memory_extractor = cast(MemoryExtractor, object())
+
+    session = create_raygent(
+        provider=_provider(),
+        model="demo-model",
+        cwd=tmp_path,
+        preset="memory_agent",
+        memory_options=RaygentMemoryOptions(
+            prompt_provider=_memory_prompt_provider,
+            recall_provider=memory_recall,
+            extractor=memory_extractor,
+        ),
+    )
+
+    assert session.deps.memory_prompt_provider is _memory_prompt_provider
+    assert session.deps.memory_recall_provider is memory_recall
+    assert session.deps.memory_extractor is memory_extractor
+    assert session.config.tools == ()
+
+
+def test_repo_maintainer_preset_requires_permission_options(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires explicit permission options"):
+        create_raygent(
+            provider=_provider(),
+            model="demo-model",
+            cwd=tmp_path,
+            preset="repo_maintainer",
+            preset_options=RaygentPresetOptions(allow_filesystem_mutation=True),
+        )
+
+
+def test_preset_defaults_do_not_override_option_group_choices(
+    tmp_path: Path,
+) -> None:
+    tool = build_tool(
+        ToolSpec(
+            name="ExplicitOptionTool",
+            description="Tool supplied through RaygentToolOptions.",
+            input_model=_EmptyInput,
+            call=_unused_call,
+            is_read_only=True,
+            is_destructive=False,
+        )
+    )
+    transcript_store = JsonlTranscriptStore(tmp_path / "manual-transcripts")
+    task_output_dir = tmp_path / "manual-tasks"
+
+    session = create_raygent(
+        provider=_provider(),
+        model="demo-model",
+        cwd=tmp_path,
+        preset="repo_maintainer",
+        preset_options=RaygentPresetOptions(allow_filesystem_mutation=True),
+        permission_context=ToolPermissionContext(),
+        tool_options=RaygentToolOptions(tools=(tool,)),
+        context_options=RaygentContextOptions(context=(_context_provider,)),
+        persistence_options=RaygentPersistenceOptions(
+            transcript_store=transcript_store,
+            task_output_dir=task_output_dir,
+        ),
+    )
+
+    assert session.config.tools == (tool,)
+    assert session.deps.context_providers == (_context_provider,)
+    assert session.transcript_store is transcript_store
+    assert session.output_dir == task_output_dir.resolve()
+
+
+def test_full_developer_preset_requires_permission_options(tmp_path: Path) -> None:
+    options = RaygentPresetOptions(
+        allow_full_developer=True,
+        allow_filesystem_mutation=True,
+        allow_shell=True,
+        allow_agents=True,
+        allow_mcp=True,
+        allow_worktree=True,
+    )
+
+    with pytest.raises(ValueError, match="requires explicit permission options"):
+        create_raygent(
+            provider=_provider(),
+            model="demo-model",
+            cwd=tmp_path,
+            preset="full_developer",
+            preset_options=options,
+        )
+
+
+@pytest.mark.asyncio
+async def test_full_developer_preset_enables_project_tools_and_bash_when_acknowledged(
+    tmp_path: Path,
+) -> None:
+    session = create_raygent(
+        provider=_provider(),
+        model="demo-model",
+        cwd=tmp_path,
+        preset="full_developer",
+        preset_options=RaygentPresetOptions(
+            allow_full_developer=True,
+            allow_filesystem_mutation=True,
+            allow_shell=True,
+            allow_agents=True,
+            allow_mcp=True,
+            allow_worktree=True,
+        ),
+        permission_context=ToolPermissionContext(),
+    )
+
+    assert BASH_TOOL_NAME in await _turn_tools(session)
+
+
+@pytest.mark.asyncio
+async def test_full_developer_preset_merges_bash_into_tool_option_profile(
+    tmp_path: Path,
+) -> None:
+    search_backend = cast(SearchBackend, object())
+    session = create_raygent(
+        provider=_provider(),
+        model="demo-model",
+        cwd=tmp_path,
+        preset="full_developer",
+        preset_options=RaygentPresetOptions(
+            allow_full_developer=True,
+            allow_filesystem_mutation=True,
+            allow_shell=True,
+            allow_agents=True,
+            allow_mcp=True,
+            allow_worktree=True,
+        ),
+        permission_context=ToolPermissionContext(),
+        tool_options=RaygentToolOptions(
+            profile_options=RaygentToolProfileOptions(search_backend=search_backend),
+        ),
+    )
+
+    assert BASH_TOOL_NAME in await _turn_tools(session)
 
 
 def _manual_session_with_engine(

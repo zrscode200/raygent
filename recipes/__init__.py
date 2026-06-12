@@ -1,0 +1,1 @@
+"""Copyable Raygent construction recipes."""

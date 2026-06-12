@@ -33,6 +33,12 @@ Embedding factory:
   - `RaygentPersistenceOptions`
   - `RaygentAgentOptions`
   - `RaygentObservabilityOptions`
+  - `RaygentPreset`
+  - `RaygentOverlay`
+  - `RaygentPresetOptions`
+  - `RaygentPresetDescription`
+  - `RaygentPresetResolution`
+  - `RaygentPresetCompatibilityError`
   - `RaygentCallbackHandle`
   - `RaygentKernelEventCallback`
   - `RaygentKernelEventCallbackSink`
@@ -50,6 +56,9 @@ Embedding factory:
   - `RaygentContextProfile`
   - `RaygentContextProfileOptions`
   - `RaygentContextSelection`
+  - `list_raygent_presets(...)`
+  - `describe_raygent_preset(...)`
+  - `resolve_raygent_preset(...)`
 
 `raygent_harness.sdk` is the recommended ergonomic entrypoint for headless
 embedding. It assembles the same kernel primitives listed below and returns a
@@ -63,12 +72,88 @@ sessions from explicit `RaygentFactoryConfig` values. `RaygentSessionFactory`
 is a narrow structural Protocol for product/application code that wants to
 depend on a factory seam without subclassing Raygent internals.
 
-`Raygent*Options` groups are explicit capability wiring surfaces, not presets.
+`Raygent*Options` groups are explicit capability wiring surfaces. Product
+presets are a convenience layer over those groups, not a replacement for them.
 They expose existing kernel seams for model/provider configuration, session
 identity, tools/hooks/media services, context providers, permissions, memory,
 persistence, agents/coordinator/remotes, and observability. Products decide
 which concrete services to inject; the SDK does not silently enable advanced
 behaviors.
+
+`create_raygent(..., preset=..., overlays=...)` is available for common
+construction paths. Presets resolve to ordinary factory options and can be
+inspected before use:
+
+```python
+from raygent_harness.sdk import describe_raygent_preset, resolve_raygent_preset
+
+description = describe_raygent_preset("project_reader")
+resolved = resolve_raygent_preset("project_reader")
+```
+
+Preset construction API:
+
+- `preset`: one named composition from `RaygentPreset`. It may be supplied to
+  `create_raygent(...)` or stored on `RaygentFactoryConfig`.
+- `overlays`: optional additive composition flags from `RaygentOverlay`.
+  Overlays are only valid when `preset` is also set.
+- `preset_options`: a `RaygentPresetOptions` value for local roots, services,
+  and explicit safety acknowledgements.
+- `resolve_raygent_preset(...)`: returns `RaygentPresetResolution`, including
+  ordinary `factory_kwargs`, `enabled_capabilities`, `required_options`,
+  `safety_notes`, `tool_names`, `context_profile`, `enable_bash`, and whether
+  explicit permission options are required.
+- `describe_raygent_preset(...)`: returns `RaygentPresetDescription` metadata
+  for documentation, UI display, or preflight checks.
+- `list_raygent_presets(...)`: returns the supported preset names in
+  documentation order.
+
+Preset defaults fill only unset factory surfaces. Flat `create_raygent(...)`
+arguments still take precedence over option groups, and explicit option groups
+remain escape hatches over preset defaults:
+
+- `RaygentToolOptions.tools` overrides preset tool defaults.
+- `RaygentContextOptions.context` overrides preset context defaults.
+- `RaygentPersistenceOptions.transcript_store` overrides preset transcript
+  store defaults.
+- `RaygentPersistenceOptions.task_output_dir` overrides preset task-output
+  defaults.
+
+When a preset creates local transcript storage and no `preset_options.project_root`
+or `preset_options.transcript_dir` is supplied, the SDK derives the root from
+the session cwd: flat `cwd` first, then `RaygentSessionOptions.cwd`, then `"."`.
+Callers that need product-owned storage policy should pass an explicit
+`RaygentPersistenceOptions.transcript_store` or `RaygentPresetOptions`.
+
+Required preset names:
+
+- `minimal`: model/provider only; no SDK-owned tools, context, memory, or
+  persistence.
+- `chat`: conversation session with local JSONL transcript support.
+- `embedded_app`: application embedding profile with transcripts and
+  observability, but no filesystem tools.
+- `project_reader`: project context with `Read`, `Glob`, `Grep`, and
+  `ToolSearch` only.
+- `code_review`: read/search-oriented repository review profile with mutation
+  disabled by default.
+- `repo_maintainer`: project workflow profile with persistence and recovery-
+  oriented state. It installs project file tools, so it requires
+  `RaygentPresetOptions(allow_filesystem_mutation=True)` plus an explicit
+  permission surface.
+- `research_agent`: search/MCP-oriented profile with low filesystem authority;
+  concrete MCP/web/search services remain caller-provided.
+- `memory_agent`: memory-ready profile that requires caller-provided
+  `RaygentMemoryOptions`.
+- `long_running_task`: durable long-session profile with transcripts, task
+  output, compaction, and recovery orientation.
+- `full_developer`: broad developer bundle that fails fast unless explicit
+  safety acknowledgements and permission options are supplied.
+
+Supported overlays are `transcripts`, `observability`, `memory`, `goals`,
+`compaction`, `recovery`, `task_output`, `readonly_tools`, `file_tools`,
+`bash`, `agents`, `coordinator`, `mcp`, and `worktree`. Mutating/open-world
+overlays require explicit acknowledgement through `RaygentPresetOptions` and an
+explicit permission surface; they are not enabled silently.
 
 `RaygentSession` exposes existing kernel streams and handles rather than a
 separate runtime loop:
@@ -107,7 +192,7 @@ Callback helpers are adapter conveniences, not a product event schema:
 - There is no global event bus, late-attachment backlog, product telemetry
   dashboard, raw-content telemetry default, or product-specific mutation hook.
 
-SDK profiles are explicit and conservative:
+Low-level SDK tool/context profiles remain explicit and conservative:
 
 - `tools="none"`: no SDK-owned tools.
 - `tools="file"`: `Read`, `Write`, `Edit`, and `NotebookEdit`, with file-tool
@@ -123,6 +208,10 @@ SDK profiles are explicit and conservative:
 Advanced Agent, Skill, MCP, remote, team, SendMessage, coordinator, memory, and
 shell behaviors remain explicit opt-ins through lower-level providers/options;
 the SDK factory does not install them silently.
+
+Copyable construction examples live outside the runtime package under
+`recipes/create_raygent/`. Runtime library behavior remains under
+`src/raygent_harness/`.
 
 Conversation and loop:
 

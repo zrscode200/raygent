@@ -22,6 +22,12 @@ sinks you want to install. The recommended ergonomic entrypoints are
 builders. Both assemble the low-level kernel primitives into
 conversation-scoped `RaygentSession` objects.
 
+For common embedding shapes, `create_raygent(...)` also accepts documented
+presets such as `minimal`, `chat`, `project_reader`, `repo_maintainer`,
+`memory_agent`, `long_running_task`, and `full_developer`. Presets are
+inspectable compositions over the same factory options; broad developer
+capabilities require explicit safety and permission choices.
+
 ## What The Kernel Provides
 
 Core runtime:
@@ -87,6 +93,10 @@ uv run pyright src tests
 ```
 
 Run examples:
+
+```bash
+uv run python -m recipes.create_raygent.project_reader
+```
 
 ```bash
 uv run python examples/minimal_query.py

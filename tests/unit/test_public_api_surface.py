@@ -27,8 +27,14 @@ DOCUMENTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "RaygentMemoryOptions",
         "RaygentModelOptions",
         "RaygentObservabilityOptions",
+        "RaygentOverlay",
         "RaygentPermissionOptions",
         "RaygentPersistenceOptions",
+        "RaygentPreset",
+        "RaygentPresetCompatibilityError",
+        "RaygentPresetDescription",
+        "RaygentPresetOptions",
+        "RaygentPresetResolution",
         "RaygentRuntimeHandles",
         "RaygentRunCallbacks",
         "RaygentSDKError",
@@ -45,6 +51,9 @@ DOCUMENTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "RaygentToolProfileOptions",
         "RaygentToolSelection",
         "create_raygent",
+        "describe_raygent_preset",
+        "list_raygent_presets",
+        "resolve_raygent_preset",
     ),
     "raygent_harness.core.query_engine": (
         "QueryEngine",
@@ -300,6 +309,20 @@ def test_sdk_all_matches_documented_contract() -> None:
     exported = cast(tuple[str, ...], module.__all__)
 
     assert set(exported) == set(DOCUMENTED_SYMBOLS["raygent_harness.sdk"])
+
+
+def test_public_api_doc_describes_preset_precedence_contract() -> None:
+    doc_text = DOC_PATH.read_text()
+
+    for expected in (
+        "`RaygentToolOptions.tools` overrides preset tool defaults",
+        "`RaygentContextOptions.context` overrides preset context defaults",
+        "`RaygentPersistenceOptions.transcript_store` overrides preset transcript",
+        "`RaygentPersistenceOptions.task_output_dir` overrides preset task-output",
+        "explicit permission surface",
+        "`RaygentPresetResolution`",
+    ):
+        assert expected in doc_text
 
 
 def test_documented_module_imports_are_available() -> None:
