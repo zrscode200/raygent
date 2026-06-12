@@ -355,7 +355,12 @@ Bounded improvement proposals and gates:
   - supplied evaluation results include `required` for fail-closed decisions
   - data-only outcome/archive-decision records derive bounded post-evaluation
     decisions without promotion or archive persistence authority
+  - injected archive persistence requires explicit call-time approval and a
+    caller-owned `ImprovementPatchCandidateArchiveStore`
   - `DEFAULT_IMPROVEMENT_MODEL_GENERATOR_SYSTEM_PROMPT`
+  - `DEFAULT_MAX_ARCHIVE_STORAGE_KEY_CHARS`
+  - `DEFAULT_MAX_ARCHIVE_STORAGE_KIND_CHARS`
+  - `DEFAULT_MAX_ARCHIVE_RECORD_METADATA_CHARS`
   - `DEFAULT_MAX_MATERIALIZATION_OPERATIONS`
   - `DEFAULT_MAX_MATERIALIZATION_PATH_CHARS`
   - `DEFAULT_MAX_MATERIALIZATION_TEXT_CHARS`
@@ -418,8 +423,17 @@ Bounded improvement proposals and gates:
   - `ImprovementPatchCandidateOutcomePolicy`
   - `ImprovementPatchCandidateArchiveDecision`
   - `ImprovementPatchCandidateArchiveDecisionPolicy`
+  - `ImprovementPatchCandidateArchiveStatus`
+  - `ImprovementPatchCandidateArchiveApproval`
+  - `ImprovementPatchCandidateArchiveRequest`
+  - `ImprovementPatchCandidateArchiveStoreResult`
+  - `ImprovementPatchCandidateArchiveStore`
+  - `ImprovementPatchCandidateArchiveRecord`
+  - `ImprovementPatchCandidateArchiver`
   - `ImprovementPatchCandidateOutcomeError`
   - `ImprovementPatchCandidateOutcomeValidationError`
+  - `ImprovementPatchCandidateArchiveError`
+  - `ImprovementPatchCandidateArchiveValidationError`
   - `ImprovementPatchCandidateMaterializationError`
   - `ImprovementPatchCandidateMaterializationValidationError`
   - `ImprovementDiagnosis`
@@ -460,6 +474,12 @@ Bounded improvement proposals and gates:
   - `improvement_patch_candidate_outcome_from_dict(...)`
   - `improvement_patch_candidate_archive_decision_to_dict(...)`
   - `improvement_patch_candidate_archive_decision_from_dict(...)`
+  - `improvement_patch_candidate_archive_request_to_dict(...)`
+  - `improvement_patch_candidate_archive_request_from_dict(...)`
+  - `improvement_patch_candidate_archive_store_result_to_dict(...)`
+  - `improvement_patch_candidate_archive_store_result_from_dict(...)`
+  - `improvement_patch_candidate_archive_record_to_dict(...)`
+  - `improvement_patch_candidate_archive_record_from_dict(...)`
   - `improvement_diagnosis_to_dict(...)`
   - `improvement_diagnosis_from_dict(...)`
   - `improvement_evaluation_check_to_dict(...)`
@@ -472,7 +492,7 @@ Bounded improvement proposals and gates:
   - `improvement_run_from_dict(...)`
 
 The improvement package is an RSI-001/RSI-002A/RSI-002B/RSI-003A/RSI-003B/
-RSI-003C/RSI-004A contract surface. It produces structured proposal records
+RSI-003C/RSI-004A/RSI-004B contract surface. It produces structured proposal records
 from bounded evidence, can derive reviewable gate decisions from caller-supplied
 gate results, and can optionally ask an injected model provider for proposal
 JSON through `ImprovementModelGenerator`.
@@ -507,18 +527,28 @@ Supplied evaluation records derive `pass`, `warn`, `fail`, or `needs_review`
 from caller-supplied results; required failures fail, optional failures warn,
 and missing results fail closed to `needs_review`.
 The improvement package still does not execute shell commands, commit, promote
-candidates, archive candidates, or parse product `/goal` commands.
+candidates, ship a concrete archive backend, search archives, clean worktrees,
+or parse product `/goal` commands.
 `ImprovementPatchCandidateOutcomePolicy` derives bounded data-only outcome
 decisions from materialization and supplied evaluation records; outcome decisions
 are not promotion authority. `promotable` means eligible for a later explicit
 promotion attempt only. `ImprovementPatchCandidateArchiveDecisionPolicy`
 derives bounded archive recommendations from outcomes; archive decisions are recommendations
 only and do not write archive files or search an archive store.
+`ImprovementPatchCandidateArchiver` is injected archive persistence only: it
+requires an archive-recommended outcome, a matching archive decision, explicit
+call-time `filesystem_mutation` approval, and a caller-owned
+`ImprovementPatchCandidateArchiveStore`. It invokes the store once with a
+normalized `ImprovementPatchCandidateArchiveRequest`, validates the returned
+bounded storage reference, and returns an immutable
+`ImprovementPatchCandidateArchiveRecord` with a service-owned `archive_digest`
+separate from the candidate `patch_digest`. Approval fields,
+`archive_id`, `created_at`, and store-result metadata are not archive identity.
 Later runner, archive, promotion, and product orchestration layers should
 compose around these records rather than weakening this proposal-only,
 model-call-only, supplied-result gate, data-only candidate, isolated
-allocation, injected-materialization, and data-only outcome/archive-decision
-boundary.
+allocation, injected-materialization, data-only outcome/archive-decision, and
+injected archive-store boundary.
 
 Worktrees and remote-agent seam:
 
