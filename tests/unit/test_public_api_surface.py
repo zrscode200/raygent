@@ -1,0 +1,330 @@
+"""Import contracts for docs/public_api_surface.md."""
+
+from __future__ import annotations
+
+import importlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType
+from typing import cast
+
+DOC_PATH = Path(__file__).parents[2] / "docs" / "public_api_surface.md"
+
+DOCUMENTED_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "raygent_harness.sdk": (
+        "RaygentCallbackHandle",
+        "RaygentAgentOptions",
+        "RaygentContextOptions",
+        "RaygentContextProfile",
+        "RaygentContextProfileOptions",
+        "RaygentContextSelection",
+        "RaygentFactory",
+        "RaygentFactoryConfig",
+        "RaygentKernelEventCallback",
+        "RaygentKernelEventCallbackSink",
+        "RaygentMemoryOptions",
+        "RaygentModelOptions",
+        "RaygentObservabilityOptions",
+        "RaygentPermissionOptions",
+        "RaygentPersistenceOptions",
+        "RaygentRuntimeHandles",
+        "RaygentRunCallbacks",
+        "RaygentSDKError",
+        "RaygentSDKMessageCallback",
+        "RaygentSDKProtocolError",
+        "RaygentSDKResultCallback",
+        "RaygentSession",
+        "RaygentSessionBusyError",
+        "RaygentSessionClosedError",
+        "RaygentSessionFactory",
+        "RaygentSessionOptions",
+        "RaygentToolOptions",
+        "RaygentToolProfile",
+        "RaygentToolProfileOptions",
+        "RaygentToolSelection",
+        "create_raygent",
+    ),
+    "raygent_harness.core.query_engine": (
+        "QueryEngine",
+        "SDKSystemInit",
+        "SDKAssistantMessage",
+        "SDKUserMessage",
+        "SDKCompactBoundary",
+        "SDKResult",
+    ),
+    "raygent_harness.core.config": (
+        "QueryConfig",
+        "SamplingParams",
+        "TurnBudget",
+    ),
+    "raygent_harness.core.deps": ("QueryDeps",),
+    "raygent_harness.core.tool": (
+        "Tool",
+        "ToolSpec",
+        "ToolUseContext",
+        "ToolResult",
+        "ToolProgress",
+        "ToolCallError",
+        "QueryTracking",
+        "build_tool",
+    ),
+    "raygent_harness.core.task": ("AppStateStore",),
+    "raygent_harness.core.model_provider": (
+        "ModelProvider",
+        "UnavailableModelProvider",
+        "classify_exception_by_name",
+    ),
+    "raygent_harness.core.model_types": (
+        "TokenCountRequest",
+        "TokenCountResult",
+    ),
+    "raygent_harness.core.messages": (
+        "MessageParam",
+        "user_message",
+        "assistant_message",
+    ),
+    "raygent_harness.core.context_providers": (
+        "ContextFragment",
+        "ContextKind",
+        "ContextProvider",
+        "PostToolContextProvider",
+        "context_provider_kind",
+        "filter_context_providers_by_kind",
+        "render_system_context",
+        "render_user_context_messages",
+    ),
+    "raygent_harness.agents": (
+        "AgentContextPolicy",
+        "AgentDefinition",
+        "deps_for_agent_context_policy",
+    ),
+    "raygent_harness.adapters.model_protocols": (
+        "AnthropicMessagesAdapter",
+        "OpenAIResponsesAdapter",
+    ),
+    "raygent_harness.adapters.model_runtime": (
+        "ProviderModelCatalog",
+        "ProviderModelEntry",
+        "ProtocolModelProvider",
+        "ProviderPayloadError",
+        "ProviderRetryDecision",
+        "ProviderRetryPolicy",
+        "ProviderTransport",
+        "ProviderTransportRequest",
+        "RetryOperation",
+        "capabilities_from_modalities",
+        "classify_retry_decision",
+        "merge_model_info",
+        "merge_model_infos",
+        "registry_from_catalogs",
+        "should_fallback_stream_to_complete",
+    ),
+    "raygent_harness.context_providers.defaults": ("build_default_context_providers",),
+    "raygent_harness.context_providers.environment": (
+        "EnvironmentContextProvider",
+        "GitCommandResult",
+        "GitCommandRunner",
+        "GitStatusContextProvider",
+        "default_git_command_runner",
+    ),
+    "raygent_harness.context_providers.project_instructions": (
+        "ConditionalInstructionRule",
+        "ProjectInstructionConfig",
+        "ProjectInstructionFile",
+        "ProjectInstructionsContextProvider",
+        "ReadAdjacentProjectInstructionsContextProvider",
+        "discover_conditional_instruction_rules",
+        "discover_project_instruction_files",
+        "instruction_rule_matches_path",
+        "resolve_project_instructions_for_target_path",
+    ),
+    "raygent_harness.context_providers.transcript_search": (
+        "TranscriptSearchContextProvider",
+        "TranscriptSearchQueryResolver",
+    ),
+    "raygent_harness.coordinator": (
+        "CoordinatorRuntime",
+        "CoordinatorRuntimeConfig",
+        "CoordinatorRuntimeSnapshot",
+        "CoordinatorRuntimeSnapshotLoadResult",
+        "CoordinatorRuntimeSnapshotStore",
+        "JsonCoordinatorRuntimeSnapshotStore",
+        "coordinator_runtime_snapshot_from_dict",
+        "coordinator_runtime_snapshot_to_dict",
+    ),
+    "raygent_harness.services.agent_routes": (
+        "AgentRouteRecordLoadResult",
+        "AgentRouteRecordStore",
+        "JsonAgentRouteRecordStore",
+        "normalize_agent_route_record_for_resume",
+    ),
+    "raygent_harness.services.runtime_recovery": (
+        "RuntimeRecoveryRequest",
+        "RuntimeRecoveryResult",
+        "RuntimeRecoveryService",
+        "RuntimeRecoveryTaskOutputStatus",
+        "RuntimeRecoveryWarning",
+        "RuntimeRecoveryWarningSource",
+        "RuntimeRecoveryWorktreeStatus",
+        "resume_runtime_session",
+    ),
+    "raygent_harness.services.file_media": (
+        "PDF_MAX_EXTRACT_SIZE_BYTES",
+        "PDF_PAGE_RENDER_DPI",
+        "CommandBackedPdfDocumentService",
+        "CommandResult",
+        "CommandRunner",
+        "FileMediaClassification",
+        "NOTEBOOK_LARGE_OUTPUT_THRESHOLD_CHARS",
+        "NOTEBOOK_MAX_PROCESSED_BYTES",
+        "NOTEBOOK_MAX_RAW_BYTES",
+        "NOTEBOOK_OUTPUT_TEXT_MAX_CHARS",
+        "NotebookCellOutput",
+        "NotebookCellSource",
+        "NotebookOutputImage",
+        "NotebookParseResult",
+        "NotebookServiceError",
+        "NotebookServiceErrorReason",
+        "PdfDocumentService",
+        "PdfExtractedPage",
+        "PdfPageCountResult",
+        "PdfPageExtractionRequest",
+        "PdfPageExtractionResult",
+        "PdfServiceError",
+        "PdfServiceErrorReason",
+        "SubprocessCommandRunner",
+        "classify_file_extension",
+        "classify_file_media",
+        "classify_magic_bytes",
+        "detect_supported_image_media_type",
+        "extension_for_path",
+        "is_blocked_device_path",
+        "notebook_cells_to_content",
+        "notebook_cells_to_json",
+        "parse_notebook_content",
+    ),
+    "raygent_harness.services.task_notification_replay": (
+        "TaskNotificationReplayCoordinator",
+        "TaskNotificationReplayRecord",
+        "TaskNotificationReplayResult",
+        "TaskNotificationReplaySource",
+        "remote_agent_restore_replay_record",
+        "remote_agent_terminal_dedupe_key",
+        "replay_task_notifications",
+    ),
+    "raygent_harness.tools": (
+        "NOTEBOOK_EDIT_MAX_RESULT_SIZE_CHARS",
+        "NOTEBOOK_EDIT_PROMPT",
+        "NOTEBOOK_EDIT_TOOL_NAME",
+        "NotebookEditInput",
+        "NotebookEditResult",
+        "NotebookEditToolError",
+        "build_notebook_edit_tool",
+        "create_notebook_edit_catalog_provider",
+        "parse_notebook_cell_id",
+    ),
+    "raygent_harness.services.transcript": (
+        "TranscriptSearchCompactMode",
+        "TranscriptSearchMatch",
+        "TranscriptSearchOrder",
+        "TranscriptSearchRequest",
+        "TranscriptSearchResult",
+        "TranscriptSearchScope",
+        "TranscriptSearchService",
+    ),
+}
+
+DOCUMENTED_MODULES: tuple[str, ...] = (
+    "raygent_harness.sdk",
+    "raygent_harness.core.model_types",
+    "raygent_harness.core.permissions",
+    "raygent_harness.core.permission_engine",
+    "raygent_harness.core.tool_hooks",
+    "raygent_harness.core.stop_hooks",
+    "raygent_harness.core.observability",
+    "raygent_harness.core.context_providers",
+    "raygent_harness.tools",
+    "raygent_harness.context_providers.defaults",
+    "raygent_harness.context_providers.environment",
+    "raygent_harness.context_providers.project_instructions",
+    "raygent_harness.context_providers.transcript_search",
+    "raygent_harness.memdir",
+    "raygent_harness.services.extract_memories",
+    "raygent_harness.services.team_memory_sync",
+    "raygent_harness.services.transcript",
+    "raygent_harness.services.task_output",
+    "raygent_harness.services.worktree",
+    "raygent_harness.services.remote_agent",
+    "raygent_harness.services.agent_routes",
+    "raygent_harness.services.runtime_recovery",
+    "raygent_harness.services.task_notification_replay",
+    "raygent_harness.services.mcp",
+    "raygent_harness.adapters.model_protocols",
+    "raygent_harness.adapters.model_runtime",
+    "raygent_harness.core.child_query",
+    "raygent_harness.core.tool_execution",
+    "raygent_harness.core.tool_orchestration",
+    "raygent_harness.core.streaming_tool_executor",
+    "raygent_harness.coordinator",
+    "raygent_harness.agents",
+    "raygent_harness.skills",
+    "raygent_harness.services.compact",
+    "raygent_harness.services.handoff",
+    "raygent_harness.services.file_media",
+)
+
+
+def _import_module(module_name: str) -> ModuleType:
+    return importlib.import_module(module_name)
+
+
+def _symbol_appears_in_doc(doc_text: str, symbol_name: str) -> bool:
+    return f"`{symbol_name}`" in doc_text or f"`{symbol_name}(" in doc_text
+
+
+def test_documented_symbol_imports_are_available() -> None:
+    doc_text = DOC_PATH.read_text()
+
+    for module_name, symbol_names in DOCUMENTED_SYMBOLS.items():
+        assert module_name in doc_text
+        module = _import_module(module_name)
+        for symbol_name in symbol_names:
+            assert _symbol_appears_in_doc(doc_text, symbol_name)
+            assert hasattr(module, symbol_name), f"{module_name}.{symbol_name} is documented"
+
+
+def test_sdk_all_matches_documented_contract() -> None:
+    module = _import_module("raygent_harness.sdk")
+    exported = cast(tuple[str, ...], module.__all__)
+
+    assert set(exported) == set(DOCUMENTED_SYMBOLS["raygent_harness.sdk"])
+
+
+def test_documented_module_imports_are_available() -> None:
+    doc_text = DOC_PATH.read_text()
+
+    for module_name in DOCUMENTED_MODULES:
+        assert module_name in doc_text
+        assert _import_module(module_name)
+
+
+def test_top_level_package_remains_intentionally_minimal() -> None:
+    code = (
+        "import json, raygent_harness; "
+        "names = sorted("
+        "name for name in raygent_harness.__dict__ "
+        "if name == '__version__' or not name.startswith('_')"
+        "); "
+        "print(json.dumps(names))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    public_names = cast(list[str], json.loads(completed.stdout))
+    assert public_names == ["__version__"]
