@@ -268,6 +268,12 @@ DOCUMENTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "ImprovementPatchCandidatePlanner",
         "ImprovementPatchCandidateStatus",
         "ImprovementPatchCandidateValidationError",
+        "ImprovementPatchCandidateWorktreeAllocation",
+        "ImprovementPatchCandidateWorktreeAllocator",
+        "ImprovementPatchCandidateWorktreeApproval",
+        "ImprovementPatchCandidateWorktreeError",
+        "ImprovementPatchCandidateWorktreeStatus",
+        "ImprovementPatchCandidateWorktreeValidationError",
         "ImprovementProposal",
         "ImprovementProposalGenerator",
         "ImprovementProposalRequest",
@@ -294,6 +300,8 @@ DOCUMENTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "improvement_gate_result_to_dict",
         "improvement_patch_candidate_plan_from_dict",
         "improvement_patch_candidate_plan_to_dict",
+        "improvement_patch_candidate_worktree_allocation_from_dict",
+        "improvement_patch_candidate_worktree_allocation_to_dict",
         "improvement_proposal_from_dict",
         "improvement_proposal_to_dict",
         "improvement_run_from_dict",
@@ -385,7 +393,7 @@ def test_public_api_doc_describes_preset_precedence_contract() -> None:
         assert expected in doc_text
 
 
-def test_public_api_doc_describes_improvement_proposal_only_boundary() -> None:
+def test_public_api_doc_describes_improvement_boundary() -> None:
     doc_text = DOC_PATH.read_text()
 
     for expected in (
@@ -395,10 +403,14 @@ def test_public_api_doc_describes_improvement_proposal_only_boundary() -> None:
         "optional model-backed proposal generator uses a tool-free",
         "data-only patch candidate plans",
         "status is `planned` only",
+        "isolated worktree allocation requires explicit call-time approval",
+        "allocation status is `allocated` only",
+        "injected `WorktreeManager`",
+        "approval is not serialized as durable reusable authority",
         "`ModelProvider.complete(...)`",
         "`ModelRequest.tools == ()`",
         "does not mutate files",
-        "create worktrees",
+        "materialize patches",
         "execute shell commands",
         "call models",
         "request permissions",

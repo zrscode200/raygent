@@ -1,5 +1,15 @@
 """Bounded self-improvement proposal primitives."""
 
+from raygent_harness.improvement.candidate_worktree import (
+    ImprovementPatchCandidateWorktreeAllocation,
+    ImprovementPatchCandidateWorktreeAllocator,
+    ImprovementPatchCandidateWorktreeApproval,
+    ImprovementPatchCandidateWorktreeError,
+    ImprovementPatchCandidateWorktreeStatus,
+    ImprovementPatchCandidateWorktreeValidationError,
+    improvement_patch_candidate_worktree_allocation_from_dict,
+    improvement_patch_candidate_worktree_allocation_to_dict,
+)
 from raygent_harness.improvement.candidates import (
     ImprovementPatchCandidateError,
     ImprovementPatchCandidatePlan,
@@ -101,6 +111,12 @@ __all__ = (
     "ImprovementPatchCandidatePlanner",
     "ImprovementPatchCandidateStatus",
     "ImprovementPatchCandidateValidationError",
+    "ImprovementPatchCandidateWorktreeAllocation",
+    "ImprovementPatchCandidateWorktreeAllocator",
+    "ImprovementPatchCandidateWorktreeApproval",
+    "ImprovementPatchCandidateWorktreeError",
+    "ImprovementPatchCandidateWorktreeStatus",
+    "ImprovementPatchCandidateWorktreeValidationError",
     "ImprovementProposal",
     "ImprovementProposalGenerator",
     "ImprovementProposalRequest",
@@ -127,6 +143,8 @@ __all__ = (
     "improvement_gate_result_to_dict",
     "improvement_patch_candidate_plan_from_dict",
     "improvement_patch_candidate_plan_to_dict",
+    "improvement_patch_candidate_worktree_allocation_from_dict",
+    "improvement_patch_candidate_worktree_allocation_to_dict",
     "improvement_proposal_from_dict",
     "improvement_proposal_to_dict",
     "improvement_run_from_dict",

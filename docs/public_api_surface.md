@@ -348,6 +348,8 @@ Bounded improvement proposals and gates:
   - gate/evaluation records are supplied-result policy checks, not execution
   - optional model-backed proposal generator uses a tool-free
     `ModelProvider.complete(...)` request with `ModelRequest.tools == ()`
+  - isolated worktree allocation requires explicit call-time approval and an
+    injected `WorktreeManager`
   - `DEFAULT_IMPROVEMENT_MODEL_GENERATOR_SYSTEM_PROMPT`
   - `ImprovementTarget`
   - `ImprovementTargetKind`
@@ -371,6 +373,12 @@ Bounded improvement proposals and gates:
   - `ImprovementPatchCandidatePlanner`
   - `ImprovementPatchCandidateError`
   - `ImprovementPatchCandidateValidationError`
+  - `ImprovementPatchCandidateWorktreeStatus`
+  - `ImprovementPatchCandidateWorktreeApproval`
+  - `ImprovementPatchCandidateWorktreeAllocation`
+  - `ImprovementPatchCandidateWorktreeAllocator`
+  - `ImprovementPatchCandidateWorktreeError`
+  - `ImprovementPatchCandidateWorktreeValidationError`
   - `ImprovementDiagnosis`
   - `ImprovementEvaluationCheck`
   - `ImprovementEvaluationPlan`
@@ -395,6 +403,8 @@ Bounded improvement proposals and gates:
   - `improvement_gate_evaluation_from_dict(...)`
   - `improvement_patch_candidate_plan_to_dict(...)`
   - `improvement_patch_candidate_plan_from_dict(...)`
+  - `improvement_patch_candidate_worktree_allocation_to_dict(...)`
+  - `improvement_patch_candidate_worktree_allocation_from_dict(...)`
   - `improvement_diagnosis_to_dict(...)`
   - `improvement_diagnosis_from_dict(...)`
   - `improvement_evaluation_check_to_dict(...)`
@@ -406,24 +416,36 @@ Bounded improvement proposals and gates:
   - `improvement_run_to_dict(...)`
   - `improvement_run_from_dict(...)`
 
-The improvement package is an RSI-001/RSI-002A/RSI-002B/RSI-003A contract surface. It
-produces structured proposal records from bounded evidence, can derive
-reviewable gate decisions from caller-supplied gate results, and can optionally
-ask an injected model provider for proposal JSON through `ImprovementModelGenerator`.
-The records and gate layer does not mutate files, create worktrees,
-execute shell commands, call models, request permissions, commit, promote candidates,
-train models, or parse product `/goal` commands. `ImprovementService` validates
-bounded proposal data and may invoke an injected generator; with the optional
-model generator, that invocation is model-call only: it uses one non-streaming
-`ModelProvider.complete(...)` request with `ModelRequest.tools == ()`, then
-returns data for `ImprovementService` validation. It also includes data-only
-patch candidate plans for reviewed proposals. `ImprovementPatchCandidatePlan`
-stores data-only patch candidate plans. The candidate status is `planned` only.
-Candidate records are not authorization grants, and they do not allocate
-worktrees or materialize patches. Later patching, archive, and product
-orchestration layers should compose around these records rather than weakening
-this proposal-only, model-call-only, supplied-result gate, and data-only
-candidate boundary.
+The improvement package is an RSI-001/RSI-002A/RSI-002B/RSI-003A/RSI-003B
+contract surface. It produces structured proposal records from bounded
+evidence, can derive reviewable gate decisions from caller-supplied gate
+results, and can optionally ask an injected model provider for proposal JSON
+through `ImprovementModelGenerator`.
+The proposal records and gate layer does not mutate files.
+It does not execute shell commands, call models, request permissions, commit,
+promote candidates, train models, or parse product `/goal` commands.
+`ImprovementService` validates bounded proposal data and may invoke an injected
+generator; with the optional model generator, that invocation is model-call
+only: it uses one non-streaming `ModelProvider.complete(...)` request with
+`ModelRequest.tools == ()`, then returns data for `ImprovementService`
+validation.
+
+The package also includes data-only patch candidate plans for reviewed
+proposals. `ImprovementPatchCandidatePlan` stores data-only patch candidate
+plans. The candidate status is `planned` only. Candidate records are not
+authorization grants. `ImprovementPatchCandidateWorktreeAllocator` can allocate
+one isolated worktree for a planned candidate through an injected
+`WorktreeManager`; isolated worktree allocation requires explicit call-time
+approval for `worktree` and `filesystem_mutation`.
+Allocation approval is not serialized as durable reusable authority. Allocation
+records preserve linkage and returned worktree metadata.
+The allocation status is `allocated` only. The
+improvement package still does not materialize patches, execute shell commands,
+commit, promote candidates, archive candidates, or parse product `/goal`
+commands. Later patching, archive, and product orchestration layers should
+compose around these records rather than weakening this proposal-only,
+model-call-only, supplied-result gate, data-only candidate, and isolated
+allocation boundary.
 
 Worktrees and remote-agent seam:
 
