@@ -24,6 +24,11 @@ from raygent_harness.improvement.gates import (
     improvement_gate_result_from_dict,
     improvement_gate_result_to_dict,
 )
+from raygent_harness.improvement.model_generator import (
+    DEFAULT_IMPROVEMENT_MODEL_GENERATOR_SYSTEM_PROMPT,
+    ImprovementModelGenerator,
+    ImprovementModelGeneratorError,
+)
 from raygent_harness.improvement.models import (
     ImprovementDiagnosis,
     ImprovementEvaluationCheck,
@@ -60,6 +65,7 @@ from raygent_harness.improvement.service import (
 )
 
 __all__ = (
+    "DEFAULT_IMPROVEMENT_MODEL_GENERATOR_SYSTEM_PROMPT",
     "DEFAULT_MAX_EVIDENCE_ITEMS",
     "DEFAULT_MAX_EVIDENCE_ITEM_CHARS",
     "DEFAULT_MAX_TOTAL_EVIDENCE_CHARS",
@@ -79,6 +85,8 @@ __all__ = (
     "ImprovementGateResult",
     "ImprovementGateStatus",
     "ImprovementGateValidationError",
+    "ImprovementModelGenerator",
+    "ImprovementModelGeneratorError",
     "ImprovementProposal",
     "ImprovementProposalGenerator",
     "ImprovementProposalRequest",

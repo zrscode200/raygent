@@ -346,6 +346,9 @@ Bounded improvement proposals and gates:
 - `raygent_harness.improvement`
   - proposal-only, non-mutating improvement records and service primitives
   - gate/evaluation records are supplied-result policy checks, not execution
+  - optional model-backed proposal generator uses a tool-free
+    `ModelProvider.complete(...)` request with `ModelRequest.tools == ()`
+  - `DEFAULT_IMPROVEMENT_MODEL_GENERATOR_SYSTEM_PROMPT`
   - `ImprovementTarget`
   - `ImprovementTargetKind`
   - `ImprovementEvidence`
@@ -361,6 +364,8 @@ Bounded improvement proposals and gates:
   - `ImprovementGatePolicy`
   - `ImprovementGateError`
   - `ImprovementGateValidationError`
+  - `ImprovementModelGenerator`
+  - `ImprovementModelGeneratorError`
   - `ImprovementDiagnosis`
   - `ImprovementEvaluationCheck`
   - `ImprovementEvaluationPlan`
@@ -394,13 +399,19 @@ Bounded improvement proposals and gates:
   - `improvement_run_to_dict(...)`
   - `improvement_run_from_dict(...)`
 
-The improvement package is an RSI-001/RSI-002A contract surface. It produces
-structured proposal records from bounded evidence and can derive reviewable
-gate decisions from caller-supplied gate results. It does not mutate files,
-create worktrees, execute shell commands, call models, request permissions,
-commit, promote candidates, train models, or parse product `/goal` commands.
-Later patching, archive, and product orchestration layers should compose around
-these records rather than weakening this proposal-only and supplied-result gate
+The improvement package is an RSI-001/RSI-002A/RSI-002B contract surface. It
+produces structured proposal records from bounded evidence, can derive
+reviewable gate decisions from caller-supplied gate results, and can optionally
+ask an injected model provider for proposal JSON through `ImprovementModelGenerator`.
+The records and gate layer does not mutate files, create worktrees,
+execute shell commands, call models, request permissions, commit, promote candidates,
+train models, or parse product `/goal` commands. `ImprovementService` validates
+bounded proposal data and may invoke an injected generator; with the optional
+model generator, that invocation is model-call only: it uses one non-streaming
+`ModelProvider.complete(...)` request with `ModelRequest.tools == ()`, then
+returns data for `ImprovementService` validation. Later patching, archive, and
+product orchestration layers should compose around these records rather than
+weakening this proposal-only, model-call-only, and supplied-result gate
 boundary.
 
 Worktrees and remote-agent seam:
