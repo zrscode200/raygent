@@ -1,5 +1,14 @@
 """Bounded self-improvement proposal primitives."""
 
+from raygent_harness.improvement.candidates import (
+    ImprovementPatchCandidateError,
+    ImprovementPatchCandidatePlan,
+    ImprovementPatchCandidatePlanner,
+    ImprovementPatchCandidateStatus,
+    ImprovementPatchCandidateValidationError,
+    improvement_patch_candidate_plan_from_dict,
+    improvement_patch_candidate_plan_to_dict,
+)
 from raygent_harness.improvement.evidence import (
     DEFAULT_MAX_EVIDENCE_ITEM_CHARS,
     DEFAULT_MAX_EVIDENCE_ITEMS,
@@ -87,6 +96,11 @@ __all__ = (
     "ImprovementGateValidationError",
     "ImprovementModelGenerator",
     "ImprovementModelGeneratorError",
+    "ImprovementPatchCandidateError",
+    "ImprovementPatchCandidatePlan",
+    "ImprovementPatchCandidatePlanner",
+    "ImprovementPatchCandidateStatus",
+    "ImprovementPatchCandidateValidationError",
     "ImprovementProposal",
     "ImprovementProposalGenerator",
     "ImprovementProposalRequest",
@@ -111,6 +125,8 @@ __all__ = (
     "improvement_gate_evaluation_to_dict",
     "improvement_gate_result_from_dict",
     "improvement_gate_result_to_dict",
+    "improvement_patch_candidate_plan_from_dict",
+    "improvement_patch_candidate_plan_to_dict",
     "improvement_proposal_from_dict",
     "improvement_proposal_to_dict",
     "improvement_run_from_dict",
