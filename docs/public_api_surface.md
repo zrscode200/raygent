@@ -341,10 +341,11 @@ Transcript and output storage:
   - `TranscriptSearchService`
 - `raygent_harness.services.task_output`
 
-Bounded improvement proposals:
+Bounded improvement proposals and gates:
 
 - `raygent_harness.improvement`
   - proposal-only, non-mutating improvement records and service primitives
+  - gate/evaluation records are supplied-result policy checks, not execution
   - `ImprovementTarget`
   - `ImprovementTargetKind`
   - `ImprovementEvidence`
@@ -352,6 +353,14 @@ Bounded improvement proposals:
   - `ImprovementEvidenceBounds`
   - `ImprovementEvidenceValidationError`
   - `BoundedImprovementEvidence`
+  - `ImprovementGateKind`
+  - `ImprovementGateStatus`
+  - `ImprovementGateDecision`
+  - `ImprovementGateResult`
+  - `ImprovementGateEvaluation`
+  - `ImprovementGatePolicy`
+  - `ImprovementGateError`
+  - `ImprovementGateValidationError`
   - `ImprovementDiagnosis`
   - `ImprovementEvaluationCheck`
   - `ImprovementEvaluationPlan`
@@ -370,6 +379,10 @@ Bounded improvement proposals:
   - `improvement_target_from_dict(...)`
   - `improvement_evidence_to_dict(...)`
   - `improvement_evidence_from_dict(...)`
+  - `improvement_gate_result_to_dict(...)`
+  - `improvement_gate_result_from_dict(...)`
+  - `improvement_gate_evaluation_to_dict(...)`
+  - `improvement_gate_evaluation_from_dict(...)`
   - `improvement_diagnosis_to_dict(...)`
   - `improvement_diagnosis_from_dict(...)`
   - `improvement_evaluation_check_to_dict(...)`
@@ -381,12 +394,14 @@ Bounded improvement proposals:
   - `improvement_run_to_dict(...)`
   - `improvement_run_from_dict(...)`
 
-The improvement package is an RSI-001 contract surface. It produces structured
-proposal records from bounded evidence and stops. It does not mutate files,
-create worktrees, execute shell commands, request permissions, commit, promote
-candidates, train models, or parse product `/goal` commands. Later patching,
-evaluation, archive, and product orchestration layers should compose around
-these records rather than weakening this proposal-only boundary.
+The improvement package is an RSI-001/RSI-002A contract surface. It produces
+structured proposal records from bounded evidence and can derive reviewable
+gate decisions from caller-supplied gate results. It does not mutate files,
+create worktrees, execute shell commands, call models, request permissions,
+commit, promote candidates, train models, or parse product `/goal` commands.
+Later patching, archive, and product orchestration layers should compose around
+these records rather than weakening this proposal-only and supplied-result gate
+boundary.
 
 Worktrees and remote-agent seam:
 
