@@ -350,7 +350,16 @@ Bounded improvement proposals and gates:
     `ModelProvider.complete(...)` request with `ModelRequest.tools == ()`
   - isolated worktree allocation requires explicit call-time approval and an
     injected `WorktreeManager`
+  - materialization uses an injected `ImprovementPatchMaterializer`, records a
+    service-owned `patch_digest`, and stops before execution or promotion
+  - supplied evaluation results include `required` for fail-closed decisions
   - `DEFAULT_IMPROVEMENT_MODEL_GENERATOR_SYSTEM_PROMPT`
+  - `DEFAULT_MAX_MATERIALIZATION_OPERATIONS`
+  - `DEFAULT_MAX_MATERIALIZATION_PATH_CHARS`
+  - `DEFAULT_MAX_MATERIALIZATION_TEXT_CHARS`
+  - `DEFAULT_MAX_MATERIALIZATION_CHANGED_FILES`
+  - `DEFAULT_MAX_EVALUATION_OUTPUT_EXCERPT_CHARS`
+  - `DEFAULT_MAX_MATERIALIZATION_METADATA_CHARS`
   - `ImprovementTarget`
   - `ImprovementTargetKind`
   - `ImprovementEvidence`
@@ -379,6 +388,22 @@ Bounded improvement proposals and gates:
   - `ImprovementPatchCandidateWorktreeAllocator`
   - `ImprovementPatchCandidateWorktreeError`
   - `ImprovementPatchCandidateWorktreeValidationError`
+  - `ImprovementPatchOperationKind`
+  - `ImprovementPatchOperation`
+  - `ImprovementPatchMaterializationRequest`
+  - `ImprovementPatchMaterializationResult`
+  - `ImprovementPatchMaterializer`
+  - `ImprovementPatchCandidateMaterializationStatus`
+  - `ImprovementPatchCandidateMaterializationApproval`
+  - `ImprovementPatchCandidateMaterialization`
+  - `ImprovementPatchCandidateMaterializer`
+  - `ImprovementPatchCandidateEvaluationKind`
+  - `ImprovementPatchCandidateEvaluationStatus`
+  - `ImprovementPatchCandidateEvaluationDecision`
+  - `ImprovementPatchCandidateEvaluationResult`
+  - `ImprovementPatchCandidateEvaluation`
+  - `ImprovementPatchCandidateMaterializationError`
+  - `ImprovementPatchCandidateMaterializationValidationError`
   - `ImprovementDiagnosis`
   - `ImprovementEvaluationCheck`
   - `ImprovementEvaluationPlan`
@@ -405,6 +430,14 @@ Bounded improvement proposals and gates:
   - `improvement_patch_candidate_plan_from_dict(...)`
   - `improvement_patch_candidate_worktree_allocation_to_dict(...)`
   - `improvement_patch_candidate_worktree_allocation_from_dict(...)`
+  - `improvement_patch_operation_to_dict(...)`
+  - `improvement_patch_operation_from_dict(...)`
+  - `improvement_patch_candidate_materialization_to_dict(...)`
+  - `improvement_patch_candidate_materialization_from_dict(...)`
+  - `improvement_patch_candidate_evaluation_result_to_dict(...)`
+  - `improvement_patch_candidate_evaluation_result_from_dict(...)`
+  - `improvement_patch_candidate_evaluation_to_dict(...)`
+  - `improvement_patch_candidate_evaluation_from_dict(...)`
   - `improvement_diagnosis_to_dict(...)`
   - `improvement_diagnosis_from_dict(...)`
   - `improvement_evaluation_check_to_dict(...)`
@@ -416,7 +449,7 @@ Bounded improvement proposals and gates:
   - `improvement_run_to_dict(...)`
   - `improvement_run_from_dict(...)`
 
-The improvement package is an RSI-001/RSI-002A/RSI-002B/RSI-003A/RSI-003B
+The improvement package is an RSI-001/RSI-002A/RSI-002B/RSI-003A/RSI-003B/RSI-003C
 contract surface. It produces structured proposal records from bounded
 evidence, can derive reviewable gate decisions from caller-supplied gate
 results, and can optionally ask an injected model provider for proposal JSON
@@ -440,12 +473,23 @@ approval for `worktree` and `filesystem_mutation`.
 Allocation approval is not serialized as durable reusable authority. Allocation
 records preserve linkage and returned worktree metadata.
 The allocation status is `allocated` only. The
-improvement package still does not materialize patches, execute shell commands,
-commit, promote candidates, archive candidates, or parse product `/goal`
-commands. Later patching, archive, and product orchestration layers should
-compose around these records rather than weakening this proposal-only,
-model-call-only, supplied-result gate, data-only candidate, and isolated
-allocation boundary.
+package can also record materialization through
+`ImprovementPatchCandidateMaterializer`, which requires explicit call-time
+`filesystem_mutation` approval, validates plan/allocation linkage, normalizes
+operation and changed-file paths against the candidate expected-file set, and
+calls an injected `ImprovementPatchMaterializer`.
+It does not ship a concrete filesystem writer to materialize patches.
+Materialization records compute a service-owned `patch_digest` from normalized
+operations and changed files.
+Supplied evaluation records derive `pass`, `warn`, `fail`, or `needs_review`
+from caller-supplied results; required failures fail, optional failures warn,
+and missing results fail closed to `needs_review`.
+The improvement package still does not execute shell commands, commit, promote
+candidates, archive candidates, or parse product `/goal` commands. Later
+runner, archive, and product orchestration layers should compose around these
+records rather than weakening this proposal-only, model-call-only,
+supplied-result gate, data-only candidate, isolated allocation, and
+injected-materialization boundary.
 
 Worktrees and remote-agent seam:
 
