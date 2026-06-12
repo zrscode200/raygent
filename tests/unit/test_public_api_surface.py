@@ -243,6 +243,43 @@ DOCUMENTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "TranscriptSearchScope",
         "TranscriptSearchService",
     ),
+    "raygent_harness.improvement": (
+        "BoundedImprovementEvidence",
+        "ImprovementDiagnosis",
+        "ImprovementEvaluationCheck",
+        "ImprovementEvaluationPlan",
+        "ImprovementEvidence",
+        "ImprovementEvidenceBounds",
+        "ImprovementEvidenceSource",
+        "ImprovementEvidenceValidationError",
+        "ImprovementProposal",
+        "ImprovementProposalGenerator",
+        "ImprovementProposalRequest",
+        "ImprovementRequiredPermission",
+        "ImprovementRun",
+        "ImprovementRunStatus",
+        "ImprovementService",
+        "ImprovementServiceError",
+        "ImprovementTarget",
+        "ImprovementTargetKind",
+        "ImprovementValidationError",
+        "improvement_diagnosis_from_dict",
+        "improvement_diagnosis_to_dict",
+        "improvement_evaluation_check_from_dict",
+        "improvement_evaluation_check_to_dict",
+        "improvement_evaluation_plan_from_dict",
+        "improvement_evaluation_plan_to_dict",
+        "improvement_evidence_from_dict",
+        "improvement_evidence_text_chars",
+        "improvement_evidence_to_dict",
+        "improvement_proposal_from_dict",
+        "improvement_proposal_to_dict",
+        "improvement_run_from_dict",
+        "improvement_run_to_dict",
+        "improvement_target_from_dict",
+        "improvement_target_to_dict",
+        "validate_bounded_improvement_evidence",
+    ),
 }
 
 DOCUMENTED_MODULES: tuple[str, ...] = (
@@ -264,6 +301,7 @@ DOCUMENTED_MODULES: tuple[str, ...] = (
     "raygent_harness.services.team_memory_sync",
     "raygent_harness.services.transcript",
     "raygent_harness.services.task_output",
+    "raygent_harness.improvement",
     "raygent_harness.services.worktree",
     "raygent_harness.services.remote_agent",
     "raygent_harness.services.agent_routes",
@@ -321,6 +359,21 @@ def test_public_api_doc_describes_preset_precedence_contract() -> None:
         "`RaygentPersistenceOptions.task_output_dir` overrides preset task-output",
         "explicit permission surface",
         "`RaygentPresetResolution`",
+    ):
+        assert expected in doc_text
+
+
+def test_public_api_doc_describes_improvement_proposal_only_boundary() -> None:
+    doc_text = DOC_PATH.read_text()
+
+    for expected in (
+        "`raygent_harness.improvement`",
+        "proposal-only, non-mutating improvement records",
+        "does not mutate files",
+        "create worktrees",
+        "execute shell commands",
+        "request permissions",
+        "product `/goal` commands",
     ):
         assert expected in doc_text
 

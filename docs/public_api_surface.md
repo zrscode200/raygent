@@ -341,6 +341,53 @@ Transcript and output storage:
   - `TranscriptSearchService`
 - `raygent_harness.services.task_output`
 
+Bounded improvement proposals:
+
+- `raygent_harness.improvement`
+  - proposal-only, non-mutating improvement records and service primitives
+  - `ImprovementTarget`
+  - `ImprovementTargetKind`
+  - `ImprovementEvidence`
+  - `ImprovementEvidenceSource`
+  - `ImprovementEvidenceBounds`
+  - `ImprovementEvidenceValidationError`
+  - `BoundedImprovementEvidence`
+  - `ImprovementDiagnosis`
+  - `ImprovementEvaluationCheck`
+  - `ImprovementEvaluationPlan`
+  - `ImprovementProposal`
+  - `ImprovementRequiredPermission`
+  - `ImprovementProposalRequest`
+  - `ImprovementProposalGenerator`
+  - `ImprovementService`
+  - `ImprovementServiceError`
+  - `ImprovementValidationError`
+  - `ImprovementRun`
+  - `ImprovementRunStatus`
+  - `validate_bounded_improvement_evidence(...)`
+  - `improvement_evidence_text_chars(...)`
+  - `improvement_target_to_dict(...)`
+  - `improvement_target_from_dict(...)`
+  - `improvement_evidence_to_dict(...)`
+  - `improvement_evidence_from_dict(...)`
+  - `improvement_diagnosis_to_dict(...)`
+  - `improvement_diagnosis_from_dict(...)`
+  - `improvement_evaluation_check_to_dict(...)`
+  - `improvement_evaluation_check_from_dict(...)`
+  - `improvement_evaluation_plan_to_dict(...)`
+  - `improvement_evaluation_plan_from_dict(...)`
+  - `improvement_proposal_to_dict(...)`
+  - `improvement_proposal_from_dict(...)`
+  - `improvement_run_to_dict(...)`
+  - `improvement_run_from_dict(...)`
+
+The improvement package is an RSI-001 contract surface. It produces structured
+proposal records from bounded evidence and stops. It does not mutate files,
+create worktrees, execute shell commands, request permissions, commit, promote
+candidates, train models, or parse product `/goal` commands. Later patching,
+evaluation, archive, and product orchestration layers should compose around
+these records rather than weakening this proposal-only boundary.
+
 Worktrees and remote-agent seam:
 
 - `raygent_harness.services.worktree`
