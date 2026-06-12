@@ -375,6 +375,12 @@ Bounded improvement proposals and gates:
   - `DEFAULT_MAX_ARCHIVE_FAILURE_SYMPTOM_CHARS`
   - `DEFAULT_MAX_ARCHIVE_ARTIFACT_REFERENCES`
   - `DEFAULT_MAX_ARCHIVE_ARTIFACT_REFERENCE_CHARS`
+  - `DEFAULT_MAX_PROMOTION_REF_CHARS`
+  - `DEFAULT_MAX_PROMOTION_KIND_CHARS`
+  - `DEFAULT_MAX_PROMOTED_FILES`
+  - `DEFAULT_MAX_PROMOTED_FILE_CHARS`
+  - `DEFAULT_MAX_PROMOTION_SUMMARY_CHARS`
+  - `DEFAULT_MAX_PROMOTION_RECORD_METADATA_CHARS`
   - `ImprovementTarget`
   - `ImprovementTargetKind`
   - `ImprovementEvidence`
@@ -430,10 +436,19 @@ Bounded improvement proposals and gates:
   - `ImprovementPatchCandidateArchiveStore`
   - `ImprovementPatchCandidateArchiveRecord`
   - `ImprovementPatchCandidateArchiver`
+  - `ImprovementPatchCandidatePromotionStatus`
+  - `ImprovementPatchCandidatePromotionApproval`
+  - `ImprovementPatchCandidatePromotionRequest`
+  - `ImprovementPatchCandidatePromotionResult`
+  - `ImprovementPatchCandidatePromoter`
+  - `ImprovementPatchCandidatePromotionRecord`
+  - `ImprovementPatchCandidatePromotionService`
   - `ImprovementPatchCandidateOutcomeError`
   - `ImprovementPatchCandidateOutcomeValidationError`
   - `ImprovementPatchCandidateArchiveError`
   - `ImprovementPatchCandidateArchiveValidationError`
+  - `ImprovementPatchCandidatePromotionError`
+  - `ImprovementPatchCandidatePromotionValidationError`
   - `ImprovementPatchCandidateMaterializationError`
   - `ImprovementPatchCandidateMaterializationValidationError`
   - `ImprovementDiagnosis`
@@ -480,6 +495,12 @@ Bounded improvement proposals and gates:
   - `improvement_patch_candidate_archive_store_result_from_dict(...)`
   - `improvement_patch_candidate_archive_record_to_dict(...)`
   - `improvement_patch_candidate_archive_record_from_dict(...)`
+  - `improvement_patch_candidate_promotion_request_to_dict(...)`
+  - `improvement_patch_candidate_promotion_request_from_dict(...)`
+  - `improvement_patch_candidate_promotion_result_to_dict(...)`
+  - `improvement_patch_candidate_promotion_result_from_dict(...)`
+  - `improvement_patch_candidate_promotion_record_to_dict(...)`
+  - `improvement_patch_candidate_promotion_record_from_dict(...)`
   - `improvement_diagnosis_to_dict(...)`
   - `improvement_diagnosis_from_dict(...)`
   - `improvement_evaluation_check_to_dict(...)`
@@ -492,7 +513,7 @@ Bounded improvement proposals and gates:
   - `improvement_run_from_dict(...)`
 
 The improvement package is an RSI-001/RSI-002A/RSI-002B/RSI-003A/RSI-003B/
-RSI-003C/RSI-004A/RSI-004B contract surface. It produces structured proposal records
+RSI-003C/RSI-004A/RSI-004B/RSI-004C contract surface. It produces structured proposal records
 from bounded evidence, can derive reviewable gate decisions from caller-supplied
 gate results, and can optionally ask an injected model provider for proposal
 JSON through `ImprovementModelGenerator`.
@@ -544,11 +565,25 @@ bounded storage reference, and returns an immutable
 `ImprovementPatchCandidateArchiveRecord` with a service-owned `archive_digest`
 separate from the candidate `patch_digest`. Approval fields,
 `archive_id`, `created_at`, and store-result metadata are not archive identity.
+`ImprovementPatchCandidatePromotionService` is injected promotion-attempt recording only:
+it requires a promotable outcome whose permissions are exactly
+`human_review`, `filesystem_mutation`, and `commit`, explicit call-time
+approval with the same exact permission set, and a caller-owned `ImprovementPatchCandidatePromoter`.
+It invokes the promoter once with a
+normalized `ImprovementPatchCandidatePromotionRequest`, validates the returned
+bounded `ImprovementPatchCandidatePromotionResult`, and returns an immutable
+`ImprovementPatchCandidatePromotionRecord` with
+`status == "promotion_recorded"` and a service-owned `promotion_digest`
+separate from the candidate `patch_digest`. Approval fields, `promotion_id`,
+`created_at`, result metadata, and result summary are not promotion identity.
+This does not ship a concrete Git promoter or prove that Raygent committed,
+merged, pushed, opened a PR, ran CI, cleaned worktrees, or mutated a canonical
+release branch.
 Later runner, archive, promotion, and product orchestration layers should
 compose around these records rather than weakening this proposal-only,
 model-call-only, supplied-result gate, data-only candidate, isolated
 allocation, injected-materialization, data-only outcome/archive-decision, and
-injected archive-store boundary.
+injected archive-store and injected promotion-attempt boundary.
 
 Worktrees and remote-agent seam:
 
