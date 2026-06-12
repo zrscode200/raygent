@@ -353,6 +353,8 @@ Bounded improvement proposals and gates:
   - materialization uses an injected `ImprovementPatchMaterializer`, records a
     service-owned `patch_digest`, and stops before execution or promotion
   - supplied evaluation results include `required` for fail-closed decisions
+  - data-only outcome/archive-decision records derive bounded post-evaluation
+    decisions without promotion or archive persistence authority
   - `DEFAULT_IMPROVEMENT_MODEL_GENERATOR_SYSTEM_PROMPT`
   - `DEFAULT_MAX_MATERIALIZATION_OPERATIONS`
   - `DEFAULT_MAX_MATERIALIZATION_PATH_CHARS`
@@ -360,6 +362,14 @@ Bounded improvement proposals and gates:
   - `DEFAULT_MAX_MATERIALIZATION_CHANGED_FILES`
   - `DEFAULT_MAX_EVALUATION_OUTPUT_EXCERPT_CHARS`
   - `DEFAULT_MAX_MATERIALIZATION_METADATA_CHARS`
+  - `DEFAULT_MAX_OUTCOME_SUMMARY_CHARS`
+  - `DEFAULT_MAX_OUTCOME_BLOCKERS`
+  - `DEFAULT_MAX_OUTCOME_BLOCKER_CHARS`
+  - `DEFAULT_MAX_OUTCOME_METADATA_CHARS`
+  - `DEFAULT_MAX_ARCHIVE_FAILURE_SYMPTOMS`
+  - `DEFAULT_MAX_ARCHIVE_FAILURE_SYMPTOM_CHARS`
+  - `DEFAULT_MAX_ARCHIVE_ARTIFACT_REFERENCES`
+  - `DEFAULT_MAX_ARCHIVE_ARTIFACT_REFERENCE_CHARS`
   - `ImprovementTarget`
   - `ImprovementTargetKind`
   - `ImprovementEvidence`
@@ -402,6 +412,14 @@ Bounded improvement proposals and gates:
   - `ImprovementPatchCandidateEvaluationDecision`
   - `ImprovementPatchCandidateEvaluationResult`
   - `ImprovementPatchCandidateEvaluation`
+  - `ImprovementPatchCandidateOutcomeDecision`
+  - `ImprovementPatchCandidateOutcomeReason`
+  - `ImprovementPatchCandidateOutcome`
+  - `ImprovementPatchCandidateOutcomePolicy`
+  - `ImprovementPatchCandidateArchiveDecision`
+  - `ImprovementPatchCandidateArchiveDecisionPolicy`
+  - `ImprovementPatchCandidateOutcomeError`
+  - `ImprovementPatchCandidateOutcomeValidationError`
   - `ImprovementPatchCandidateMaterializationError`
   - `ImprovementPatchCandidateMaterializationValidationError`
   - `ImprovementDiagnosis`
@@ -438,6 +456,10 @@ Bounded improvement proposals and gates:
   - `improvement_patch_candidate_evaluation_result_from_dict(...)`
   - `improvement_patch_candidate_evaluation_to_dict(...)`
   - `improvement_patch_candidate_evaluation_from_dict(...)`
+  - `improvement_patch_candidate_outcome_to_dict(...)`
+  - `improvement_patch_candidate_outcome_from_dict(...)`
+  - `improvement_patch_candidate_archive_decision_to_dict(...)`
+  - `improvement_patch_candidate_archive_decision_from_dict(...)`
   - `improvement_diagnosis_to_dict(...)`
   - `improvement_diagnosis_from_dict(...)`
   - `improvement_evaluation_check_to_dict(...)`
@@ -449,11 +471,11 @@ Bounded improvement proposals and gates:
   - `improvement_run_to_dict(...)`
   - `improvement_run_from_dict(...)`
 
-The improvement package is an RSI-001/RSI-002A/RSI-002B/RSI-003A/RSI-003B/RSI-003C
-contract surface. It produces structured proposal records from bounded
-evidence, can derive reviewable gate decisions from caller-supplied gate
-results, and can optionally ask an injected model provider for proposal JSON
-through `ImprovementModelGenerator`.
+The improvement package is an RSI-001/RSI-002A/RSI-002B/RSI-003A/RSI-003B/
+RSI-003C/RSI-004A contract surface. It produces structured proposal records
+from bounded evidence, can derive reviewable gate decisions from caller-supplied
+gate results, and can optionally ask an injected model provider for proposal
+JSON through `ImprovementModelGenerator`.
 The proposal records and gate layer does not mutate files.
 It does not execute shell commands, call models, request permissions, commit,
 promote candidates, train models, or parse product `/goal` commands.
@@ -485,11 +507,18 @@ Supplied evaluation records derive `pass`, `warn`, `fail`, or `needs_review`
 from caller-supplied results; required failures fail, optional failures warn,
 and missing results fail closed to `needs_review`.
 The improvement package still does not execute shell commands, commit, promote
-candidates, archive candidates, or parse product `/goal` commands. Later
-runner, archive, and product orchestration layers should compose around these
-records rather than weakening this proposal-only, model-call-only,
-supplied-result gate, data-only candidate, isolated allocation, and
-injected-materialization boundary.
+candidates, archive candidates, or parse product `/goal` commands.
+`ImprovementPatchCandidateOutcomePolicy` derives bounded data-only outcome
+decisions from materialization and supplied evaluation records; outcome decisions
+are not promotion authority. `promotable` means eligible for a later explicit
+promotion attempt only. `ImprovementPatchCandidateArchiveDecisionPolicy`
+derives bounded archive recommendations from outcomes; archive decisions are recommendations
+only and do not write archive files or search an archive store.
+Later runner, archive, promotion, and product orchestration layers should
+compose around these records rather than weakening this proposal-only,
+model-call-only, supplied-result gate, data-only candidate, isolated
+allocation, injected-materialization, and data-only outcome/archive-decision
+boundary.
 
 Worktrees and remote-agent seam:
 
