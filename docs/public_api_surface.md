@@ -353,6 +353,9 @@ Bounded improvement proposals and gates:
   - materialization uses an injected `ImprovementPatchMaterializer`, records a
     service-owned `patch_digest`, and stops before execution or promotion
   - supplied evaluation results include `required` for fail-closed decisions
+  - verification planning records derive bounded checks from a candidate plan
+    plus materialization and copy `materialization.changed_files` into
+    `allowed_changed_files` without invoking a runner
   - data-only outcome/archive-decision records derive bounded post-evaluation
     decisions without promotion or archive persistence authority
   - injected archive persistence requires explicit call-time approval and a
@@ -381,6 +384,12 @@ Bounded improvement proposals and gates:
   - `DEFAULT_MAX_PROMOTED_FILE_CHARS`
   - `DEFAULT_MAX_PROMOTION_SUMMARY_CHARS`
   - `DEFAULT_MAX_PROMOTION_RECORD_METADATA_CHARS`
+  - `DEFAULT_MAX_VERIFICATION_CHECKS`
+  - `DEFAULT_MAX_VERIFICATION_CHECK_NAME_CHARS`
+  - `DEFAULT_MAX_VERIFICATION_INSTRUCTION_CHARS`
+  - `DEFAULT_MAX_VERIFICATION_REF_CHARS`
+  - `DEFAULT_MAX_VERIFICATION_RUNNER_KIND_CHARS`
+  - `DEFAULT_MAX_VERIFICATION_RECORD_METADATA_CHARS`
   - `ImprovementTarget`
   - `ImprovementTargetKind`
   - `ImprovementEvidence`
@@ -443,12 +452,19 @@ Bounded improvement proposals and gates:
   - `ImprovementPatchCandidatePromoter`
   - `ImprovementPatchCandidatePromotionRecord`
   - `ImprovementPatchCandidatePromotionService`
+  - `ImprovementPatchCandidateVerificationPlanStatus`
+  - `ImprovementPatchCandidateVerificationCheckSource`
+  - `ImprovementPatchCandidateVerificationCheck`
+  - `ImprovementPatchCandidateVerificationPlan`
+  - `ImprovementPatchCandidateVerificationPlanner`
   - `ImprovementPatchCandidateOutcomeError`
   - `ImprovementPatchCandidateOutcomeValidationError`
   - `ImprovementPatchCandidateArchiveError`
   - `ImprovementPatchCandidateArchiveValidationError`
   - `ImprovementPatchCandidatePromotionError`
   - `ImprovementPatchCandidatePromotionValidationError`
+  - `ImprovementPatchCandidateVerificationError`
+  - `ImprovementPatchCandidateVerificationValidationError`
   - `ImprovementPatchCandidateMaterializationError`
   - `ImprovementPatchCandidateMaterializationValidationError`
   - `ImprovementDiagnosis`
@@ -501,6 +517,10 @@ Bounded improvement proposals and gates:
   - `improvement_patch_candidate_promotion_result_from_dict(...)`
   - `improvement_patch_candidate_promotion_record_to_dict(...)`
   - `improvement_patch_candidate_promotion_record_from_dict(...)`
+  - `improvement_patch_candidate_verification_check_to_dict(...)`
+  - `improvement_patch_candidate_verification_check_from_dict(...)`
+  - `improvement_patch_candidate_verification_plan_to_dict(...)`
+  - `improvement_patch_candidate_verification_plan_from_dict(...)`
   - `improvement_diagnosis_to_dict(...)`
   - `improvement_diagnosis_from_dict(...)`
   - `improvement_evaluation_check_to_dict(...)`
@@ -513,10 +533,10 @@ Bounded improvement proposals and gates:
   - `improvement_run_from_dict(...)`
 
 The improvement package is an RSI-001/RSI-002A/RSI-002B/RSI-003A/RSI-003B/
-RSI-003C/RSI-004A/RSI-004B/RSI-004C contract surface. It produces structured proposal records
-from bounded evidence, can derive reviewable gate decisions from caller-supplied
-gate results, and can optionally ask an injected model provider for proposal
-JSON through `ImprovementModelGenerator`.
+RSI-003C/RSI-004A/RSI-004B/RSI-004C/RSI-005A contract surface. It produces
+structured proposal records from bounded evidence, can derive reviewable gate
+decisions from caller-supplied gate results, and can optionally ask an injected
+model provider for proposal JSON through `ImprovementModelGenerator`.
 The proposal records and gate layer does not mutate files.
 It does not execute shell commands, call models, request permissions, commit,
 promote candidates, train models, or parse product `/goal` commands.
@@ -547,6 +567,14 @@ operations and changed files.
 Supplied evaluation records derive `pass`, `warn`, `fail`, or `needs_review`
 from caller-supplied results; required failures fail, optional failures warn,
 and missing results fail closed to `needs_review`.
+`ImprovementPatchCandidateVerificationPlanner` creates data-only verification
+planning records from a planned candidate and a materialized candidate. The
+planner preserves candidate/run/proposal/gate/base-revision linkage, copies
+`materialization.changed_files` into `allowed_changed_files`, derives bounded
+checks from `ImprovementEvaluationPlan`, and returns
+`status == "verification_planned"`. Verification plan records do not run
+checks, invoke a verifier, execute shell commands, call CI, install
+dependencies, mutate files, commit, promote candidates, or clean worktrees.
 The improvement package still does not execute shell commands, commit, promote
 candidates, ship a concrete archive backend, search archives, clean worktrees,
 or parse product `/goal` commands.
@@ -583,7 +611,8 @@ Later runner, archive, promotion, and product orchestration layers should
 compose around these records rather than weakening this proposal-only,
 model-call-only, supplied-result gate, data-only candidate, isolated
 allocation, injected-materialization, data-only outcome/archive-decision, and
-injected archive-store and injected promotion-attempt boundary.
+verification-planning-only, injected archive-store, and injected
+promotion-attempt boundary.
 
 Worktrees and remote-agent seam:
 
