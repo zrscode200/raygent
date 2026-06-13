@@ -684,6 +684,14 @@ Optional improvement runtime bridge:
   - `TaskOutputImprovementEvidenceAdapter`
   - `ImprovementObservabilitySnapshot`
   - `ObservabilitySnapshotImprovementEvidenceAdapter`
+  - `ImprovementRuntimePermissionRequirement`
+  - `ImprovementRuntimePermissionSummary`
+  - `ImprovementRuntimePermissionReport`
+  - `ImprovementRuntimePermissionStatus`
+  - `ImprovementRuntimePermissionPolicy`
+  - `ImprovementRuntimeObservabilityEvent`
+  - `ImprovementRuntimeObservabilitySink`
+  - `KernelEventImprovementRuntimeObserver`
   - `ImprovementRecordStore`
   - `ImprovementRuntimeBridge`
   - `ImprovementRuntimeBridgeConfig`
@@ -698,6 +706,16 @@ Optional improvement runtime bridge:
   - `validate_improvement_evidence_collection(...)`
   - `improvement_evidence_collection_result_to_dict(...)`
   - `improvement_evidence_collection_result_from_dict(...)`
+  - `improvement_runtime_permission_requirement_to_dict(...)`
+  - `improvement_runtime_permission_requirement_from_dict(...)`
+  - `improvement_runtime_permission_summary_to_dict(...)`
+  - `improvement_runtime_permission_summary_from_dict(...)`
+  - `improvement_runtime_permission_report_to_dict(...)`
+  - `improvement_runtime_permission_report_from_dict(...)`
+  - `improvement_runtime_permission_report_to_summary(...)`
+  - `improvement_runtime_observability_event_to_dict(...)`
+  - `improvement_runtime_observability_event_from_dict(...)`
+  - `improvement_runtime_observability_event_from_result(...)`
   - `improvement_runtime_record_to_dict(...)`
   - `improvement_runtime_record_from_dict(...)`
   - `improvement_runtime_chain_summary_to_dict(...)`
@@ -731,7 +749,13 @@ only bounded tail or range data through an injected `TaskOutputStore`.
 `ImprovementObservabilitySnapshot` records instead of replaying event-bus
 history and rejects raw-looking snapshot fields such as `prompt`, `content`,
 `output`, `tool_input`, `tool_result`, and `transcript` unless they are bounded
-redaction markers. Runtime records use
+redaction markers. `ImprovementRuntimePermissionPolicy` produces advisory
+preflight reports only: full reports are return values, not durable approval
+tokens, and `ImprovementRuntimePermissionSummary` is the only permission shape
+the bridge writes into runtime record metadata. `KernelEventImprovementRuntimeObserver`
+can emit explicit bridge transitions through `KernelEventBus` with
+`content_policy="metadata_only"`; transition event data is limited to ids,
+statuses, counts, and sanitized permission summary counts. Runtime records use
 `IMPROVEMENT_RUNTIME_RECORD_SCHEMA_VERSION` and bounded metadata so future
 stores and recovery code can summarize where an explicit improvement chain
 stopped and what record or permission is required next. RSI-006 does not modify `QueryEngine`,

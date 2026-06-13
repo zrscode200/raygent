@@ -9,18 +9,20 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from types import MappingProxyType
 from typing import Literal, Protocol, cast
 from uuid import uuid4
 
 from raygent_harness.core.model_types import FrozenJson, freeze_json
+from raygent_harness.core.observability import KernelEventBus, KernelEventContext
 from raygent_harness.improvement import (
     ImprovementEvidence,
     ImprovementEvidenceBounds,
     ImprovementEvidenceSource,
+    ImprovementRequiredPermission,
     improvement_evidence_from_dict,
     improvement_evidence_text_chars,
     improvement_evidence_to_dict,
@@ -69,6 +71,12 @@ ImprovementRuntimeRecordKind = Literal[
 ]
 ImprovementRuntimeTransitionStatus = Literal["completed", "blocked", "not_enabled"]
 ImprovementTaskOutputReadMode = Literal["tail", "range"]
+ImprovementRuntimePermissionStatus = Literal[
+    "not_required",
+    "required",
+    "approved",
+    "blocked",
+]
 
 _RUNTIME_RECORD_KINDS: frozenset[str] = frozenset(
     {
@@ -101,6 +109,35 @@ _EVIDENCE_SOURCES: frozenset[str] = frozenset(
     }
 )
 _TASK_OUTPUT_READ_MODES: frozenset[str] = frozenset({"tail", "range"})
+_PERMISSION_STATUSES: frozenset[str] = frozenset(
+    {"not_required", "required", "approved", "blocked"}
+)
+_REQUIRED_PERMISSIONS: frozenset[str] = frozenset(
+    {
+        "none",
+        "human_review",
+        "model_provider",
+        "filesystem_mutation",
+        "shell",
+        "worktree",
+        "commit",
+        "network",
+        "external_service",
+    }
+)
+_UNSAFE_RUNTIME_PERMISSION_METADATA_KEYS: frozenset[str] = frozenset(
+    {
+        "permission_report",
+        "permission_reports",
+        "permission_summary",
+        "approved_permissions",
+        "supplied_approved_permissions",
+        "approval",
+        "approvals",
+        "approver",
+        "approver_identity",
+    }
+)
 _RAW_OBSERVABILITY_METADATA_KEYS: frozenset[str] = frozenset(
     {
         "prompt",
@@ -754,6 +791,11 @@ class ImprovementRuntimeRecord:
             )
         if self.created_at < 0:
             raise ValueError("ImprovementRuntimeRecord.created_at must be >= 0")
+        _reject_unsafe_runtime_permission_metadata(
+            self.metadata,
+            "ImprovementRuntimeRecord.metadata",
+            allow_permission_summary=True,
+        )
         object.__setattr__(
             self,
             "metadata",
@@ -892,6 +934,397 @@ class ImprovementRuntimeChainSummary:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ImprovementRuntimePermissionRequirement:
+    """Advisory permission requirement for an explicit improvement stage."""
+
+    stage_id: str
+    required_permissions: tuple[ImprovementRequiredPermission, ...]
+    record_kind: ImprovementRuntimeRecordKind | None = None
+    reason: str | None = None
+    source_record_id: str | None = None
+    metadata: Mapping[str, FrozenJson] = field(default_factory=_empty_metadata)
+
+    def __post_init__(self) -> None:
+        _require_non_empty(
+            self.stage_id,
+            "ImprovementRuntimePermissionRequirement.stage_id",
+        )
+        object.__setattr__(
+            self,
+            "required_permissions",
+            _permission_tuple(
+                self.required_permissions,
+                "ImprovementRuntimePermissionRequirement.required_permissions",
+                allow_empty=False,
+            ),
+        )
+        if self.record_kind is not None:
+            _require_literal(
+                self.record_kind,
+                _RUNTIME_RECORD_KINDS,
+                "ImprovementRuntimePermissionRequirement.record_kind",
+            )
+        if self.reason is not None:
+            _require_bounded_non_empty(
+                self.reason,
+                "ImprovementRuntimePermissionRequirement.reason",
+                DEFAULT_MAX_IMPROVEMENT_RUNTIME_STOP_REASON_CHARS,
+                "DEFAULT_MAX_IMPROVEMENT_RUNTIME_STOP_REASON_CHARS",
+            )
+        if self.source_record_id is not None:
+            _require_non_empty(
+                self.source_record_id,
+                "ImprovementRuntimePermissionRequirement.source_record_id",
+            )
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_metadata(
+                self.metadata,
+                "ImprovementRuntimePermissionRequirement.metadata",
+                DEFAULT_MAX_IMPROVEMENT_RUNTIME_METADATA_CHARS,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ImprovementRuntimePermissionSummary:
+    """Sanitized permission metadata safe for durable runtime records."""
+
+    stage_id: str
+    status: ImprovementRuntimePermissionStatus
+    required_permission_count: int
+    missing_permission_count: int
+    extra_permission_count: int
+    requirement_labels: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_non_empty(self.stage_id, "ImprovementRuntimePermissionSummary.stage_id")
+        _require_literal(
+            self.status,
+            _PERMISSION_STATUSES,
+            "ImprovementRuntimePermissionSummary.status",
+        )
+        _require_minimum(
+            self.required_permission_count,
+            0,
+            "ImprovementRuntimePermissionSummary.required_permission_count",
+        )
+        _require_minimum(
+            self.missing_permission_count,
+            0,
+            "ImprovementRuntimePermissionSummary.missing_permission_count",
+        )
+        _require_minimum(
+            self.extra_permission_count,
+            0,
+            "ImprovementRuntimePermissionSummary.extra_permission_count",
+        )
+        object.__setattr__(
+            self,
+            "requirement_labels",
+            _bounded_string_tuple(
+                self.requirement_labels,
+                "ImprovementRuntimePermissionSummary.requirement_labels",
+                max_count=DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS,
+                max_chars=DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNING_CHARS,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ImprovementRuntimePermissionReport:
+    """Return-only advisory preflight report for improvement permissions."""
+
+    request_id: str
+    session_id: str
+    stage_id: str
+    status: ImprovementRuntimePermissionStatus
+    requirements: tuple[ImprovementRuntimePermissionRequirement, ...] = ()
+    supplied_approved_permissions: tuple[ImprovementRequiredPermission, ...] = ()
+    missing_permissions: tuple[ImprovementRequiredPermission, ...] = ()
+    extra_permissions: tuple[ImprovementRequiredPermission, ...] = ()
+    runtime_session_id: str | None = None
+    warnings: tuple[str, ...] = ()
+    metadata: Mapping[str, FrozenJson] = field(default_factory=_empty_metadata)
+
+    def __post_init__(self) -> None:
+        _require_non_empty(self.request_id, "ImprovementRuntimePermissionReport.request_id")
+        _require_non_empty(self.session_id, "ImprovementRuntimePermissionReport.session_id")
+        _require_non_empty(self.stage_id, "ImprovementRuntimePermissionReport.stage_id")
+        _require_literal(
+            self.status,
+            _PERMISSION_STATUSES,
+            "ImprovementRuntimePermissionReport.status",
+        )
+        if self.runtime_session_id is not None:
+            _require_non_empty(
+                self.runtime_session_id,
+                "ImprovementRuntimePermissionReport.runtime_session_id",
+            )
+        requirements = tuple(self.requirements)
+        for requirement in requirements:
+            if requirement.stage_id != self.stage_id:
+                raise ImprovementRuntimeValidationError(
+                    "ImprovementRuntimePermissionReport.requirements stage_id "
+                    "must match report stage_id"
+                )
+        object.__setattr__(self, "requirements", requirements)
+        object.__setattr__(
+            self,
+            "supplied_approved_permissions",
+            _permission_tuple(
+                self.supplied_approved_permissions,
+                "ImprovementRuntimePermissionReport.supplied_approved_permissions",
+                allow_empty=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "missing_permissions",
+            _permission_tuple(
+                self.missing_permissions,
+                "ImprovementRuntimePermissionReport.missing_permissions",
+                allow_empty=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "extra_permissions",
+            _permission_tuple(
+                self.extra_permissions,
+                "ImprovementRuntimePermissionReport.extra_permissions",
+                allow_empty=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "warnings",
+            _bounded_string_tuple(
+                self.warnings,
+                "ImprovementRuntimePermissionReport.warnings",
+                max_count=DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS,
+                max_chars=DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNING_CHARS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_metadata(
+                self.metadata,
+                "ImprovementRuntimePermissionReport.metadata",
+                DEFAULT_MAX_IMPROVEMENT_RUNTIME_METADATA_CHARS,
+            ),
+        )
+
+    def to_summary(self) -> ImprovementRuntimePermissionSummary:
+        """Return durable-safe metadata that omits approval-adjacent facts."""
+
+        return improvement_runtime_permission_report_to_summary(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ImprovementRuntimePermissionPolicy:
+    """Evaluate advisory permission facts without authorizing later stages."""
+
+    allow_extra_permissions: bool = False
+
+    def evaluate(
+        self,
+        *,
+        request_id: str,
+        session_id: str,
+        stage_id: str,
+        requirements: Sequence[ImprovementRuntimePermissionRequirement] = (),
+        approved_permissions: Sequence[ImprovementRequiredPermission] = (),
+        runtime_session_id: str | None = None,
+        metadata: Mapping[str, FrozenJson] | None = None,
+    ) -> ImprovementRuntimePermissionReport:
+        """Return a preflight report; stage services still validate approvals."""
+
+        _require_non_empty(stage_id, "ImprovementRuntimePermissionPolicy.stage_id")
+        requirement_items = tuple(requirements)
+        for requirement in requirement_items:
+            if requirement.stage_id != stage_id:
+                raise ImprovementRuntimeValidationError(
+                    "ImprovementRuntimePermissionPolicy requirements stage_id "
+                    "must match stage_id"
+                )
+        supplied = _permission_tuple(
+            approved_permissions,
+            "ImprovementRuntimePermissionPolicy.approved_permissions",
+            allow_empty=True,
+        )
+        required = _permission_set_from_requirements(requirement_items)
+        warnings: list[str] = []
+
+        if "none" in required and len(required) > 1:
+            warnings.append("permission requirement none cannot be combined")
+            status: ImprovementRuntimePermissionStatus = "blocked"
+            required_without_none = tuple(
+                permission for permission in sorted(required) if permission != "none"
+            )
+            missing = _permission_tuple(
+                required_without_none,
+                "ImprovementRuntimePermissionPolicy.missing_permissions",
+                allow_empty=True,
+            )
+            extra = _extra_permissions(supplied, required)
+        elif not required or required == {"none"}:
+            extra = _extra_permissions(supplied, {"none"})
+            missing = ()
+            status = "not_required" if not extra else "blocked"
+        else:
+            missing = _missing_permissions(required, supplied)
+            extra = _extra_permissions(supplied, required)
+            if not supplied:
+                status = "required"
+            elif missing or (extra and not self.allow_extra_permissions):
+                status = "blocked"
+            else:
+                status = "approved"
+
+        if extra and self.allow_extra_permissions:
+            warnings.append("extra approved permissions were ignored by advisory policy")
+
+        return ImprovementRuntimePermissionReport(
+            request_id=request_id,
+            session_id=session_id,
+            runtime_session_id=runtime_session_id,
+            stage_id=stage_id,
+            status=status,
+            requirements=requirement_items,
+            supplied_approved_permissions=supplied,
+            missing_permissions=missing,
+            extra_permissions=extra,
+            warnings=tuple(warnings),
+            metadata=_empty_metadata() if metadata is None else metadata,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ImprovementRuntimeObservabilityEvent:
+    """Metadata-only transition event for explicit improvement runtime calls."""
+
+    request_id: str
+    session_id: str
+    status: ImprovementRuntimeTransitionStatus
+    runtime_session_id: str | None = None
+    record_ids: tuple[str, ...] = ()
+    last_record_kind: ImprovementRuntimeRecordKind | None = None
+    evidence_count: int = 0
+    warning_count: int = 0
+    truncated: bool = False
+    stage_id: str | None = None
+    permission_status: ImprovementRuntimePermissionStatus | None = None
+    permission_required_count: int = 0
+    permission_missing_count: int = 0
+    permission_extra_count: int = 0
+
+    def __post_init__(self) -> None:
+        _require_non_empty(self.request_id, "ImprovementRuntimeObservabilityEvent.request_id")
+        _require_non_empty(self.session_id, "ImprovementRuntimeObservabilityEvent.session_id")
+        _require_literal(
+            self.status,
+            _RUNTIME_TRANSITION_STATUSES,
+            "ImprovementRuntimeObservabilityEvent.status",
+        )
+        if self.runtime_session_id is not None:
+            _require_non_empty(
+                self.runtime_session_id,
+                "ImprovementRuntimeObservabilityEvent.runtime_session_id",
+            )
+        object.__setattr__(
+            self,
+            "record_ids",
+            _bounded_string_tuple(
+                self.record_ids,
+                "ImprovementRuntimeObservabilityEvent.record_ids",
+                max_count=DEFAULT_MAX_IMPROVEMENT_RUNTIME_SUMMARY_RECORDS,
+                max_chars=DEFAULT_MAX_IMPROVEMENT_RUNTIME_PAYLOAD_REF_CHARS,
+            ),
+        )
+        if self.last_record_kind is not None:
+            _require_literal(
+                self.last_record_kind,
+                _RUNTIME_RECORD_KINDS,
+                "ImprovementRuntimeObservabilityEvent.last_record_kind",
+            )
+        _require_minimum(
+            self.evidence_count,
+            0,
+            "ImprovementRuntimeObservabilityEvent.evidence_count",
+        )
+        _require_minimum(
+            self.warning_count,
+            0,
+            "ImprovementRuntimeObservabilityEvent.warning_count",
+        )
+        if self.stage_id is not None:
+            _require_non_empty(self.stage_id, "ImprovementRuntimeObservabilityEvent.stage_id")
+        if self.permission_status is not None:
+            _require_literal(
+                self.permission_status,
+                _PERMISSION_STATUSES,
+                "ImprovementRuntimeObservabilityEvent.permission_status",
+            )
+        _require_minimum(
+            self.permission_required_count,
+            0,
+            "ImprovementRuntimeObservabilityEvent.permission_required_count",
+        )
+        _require_minimum(
+            self.permission_missing_count,
+            0,
+            "ImprovementRuntimeObservabilityEvent.permission_missing_count",
+        )
+        _require_minimum(
+            self.permission_extra_count,
+            0,
+            "ImprovementRuntimeObservabilityEvent.permission_extra_count",
+        )
+
+
+class ImprovementRuntimeObservabilitySink(Protocol):
+    """Caller-owned sink for metadata-only improvement transition events."""
+
+    def emit_transition(self, event: ImprovementRuntimeObservabilityEvent) -> None:
+        """Emit one metadata-only transition event."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class KernelEventImprovementRuntimeObserver:
+    """Emit improvement runtime transitions through a kernel event bus."""
+
+    event_bus: KernelEventBus
+    event_type: str = "improvement_runtime.transition"
+    source: str = "improvement_runtime"
+
+    def __post_init__(self) -> None:
+        _require_non_empty(
+            self.event_type,
+            "KernelEventImprovementRuntimeObserver.event_type",
+        )
+        _require_non_empty(self.source, "KernelEventImprovementRuntimeObserver.source")
+
+    def emit_transition(self, event: ImprovementRuntimeObservabilityEvent) -> None:
+        """Emit bounded metadata; `KernelEventBus` swallows sink failures."""
+
+        self.event_bus.emit(
+            self.event_type,
+            context=KernelEventContext(
+                session_id=event.session_id,
+                runtime_session_id=event.runtime_session_id,
+                source=self.source,
+            ),
+            data=improvement_runtime_observability_event_to_dict(event),
+            content_policy="metadata_only",
+            source=self.source,
+        )
+
+
 class ImprovementRecordStore(Protocol):
     """Caller-owned store for immutable improvement-chain envelopes."""
 
@@ -924,6 +1357,7 @@ class ImprovementRuntimeBridgeConfig:
     enabled: bool = False
     record_store: ImprovementRecordStore | None = None
     evidence_sources: tuple[ImprovementEvidenceSourceAdapter, ...] = ()
+    observability_sink: ImprovementRuntimeObservabilitySink | None = None
     metadata: Mapping[str, FrozenJson] = field(default_factory=_empty_metadata)
 
     def __post_init__(self) -> None:
@@ -950,6 +1384,7 @@ class ImprovementRuntimeRequest:
     runtime_session_id: str | None = None
     record_store: ImprovementRecordStore | None = None
     evidence_sources: tuple[ImprovementEvidenceSourceAdapter, ...] = ()
+    permission_report: ImprovementRuntimePermissionReport | None = None
     record_sequence: int = 1
     metadata: Mapping[str, FrozenJson] = field(default_factory=_empty_metadata)
 
@@ -982,6 +1417,22 @@ class ImprovementRuntimeRequest:
                     "must match runtime_session_id"
                 )
         object.__setattr__(self, "evidence_sources", tuple(self.evidence_sources))
+        if self.permission_report is not None:
+            if self.permission_report.request_id != self.request_id:
+                raise ImprovementRuntimeValidationError(
+                    "ImprovementRuntimeRequest.permission_report.request_id must "
+                    "match request_id"
+                )
+            if self.permission_report.session_id != self.session_id:
+                raise ImprovementRuntimeValidationError(
+                    "ImprovementRuntimeRequest.permission_report.session_id must "
+                    "match session_id"
+                )
+            if self.permission_report.runtime_session_id != self.runtime_session_id:
+                raise ImprovementRuntimeValidationError(
+                    "ImprovementRuntimeRequest.permission_report.runtime_session_id "
+                    "must match runtime_session_id"
+                )
         _require_minimum(
             self.record_sequence,
             1,
@@ -1009,6 +1460,7 @@ class ImprovementRuntimeTransitionResult:
     records: tuple[ImprovementRuntimeRecord, ...] = ()
     summary: ImprovementRuntimeChainSummary | None = None
     evidence: tuple[ImprovementEvidence, ...] = ()
+    permission_report: ImprovementRuntimePermissionReport | None = None
     warnings: tuple[str, ...] = ()
     blocked_reason: str | None = None
     metadata: Mapping[str, FrozenJson] = field(default_factory=_empty_metadata)
@@ -1034,6 +1486,22 @@ class ImprovementRuntimeTransitionResult:
             )
         object.__setattr__(self, "records", tuple(self.records))
         object.__setattr__(self, "evidence", tuple(self.evidence))
+        if self.permission_report is not None:
+            if self.permission_report.request_id != self.request_id:
+                raise ImprovementRuntimeValidationError(
+                    "ImprovementRuntimeTransitionResult.permission_report.request_id "
+                    "must match request_id"
+                )
+            if self.permission_report.session_id != self.session_id:
+                raise ImprovementRuntimeValidationError(
+                    "ImprovementRuntimeTransitionResult.permission_report.session_id "
+                    "must match session_id"
+                )
+            if self.permission_report.runtime_session_id != self.runtime_session_id:
+                raise ImprovementRuntimeValidationError(
+                    "ImprovementRuntimeTransitionResult.permission_report."
+                    "runtime_session_id must match runtime_session_id"
+                )
         object.__setattr__(
             self,
             "warnings",
@@ -1083,36 +1551,42 @@ class ImprovementRuntimeBridge:
         """Collect evidence through injected adapters and return one transition result."""
 
         if not self.config.enabled or not request.enabled:
-            return _runtime_result(
-                request,
-                status="not_enabled",
-                blocked_reason="improvement runtime bridge is not enabled",
-                record_kind="runtime_not_enabled",
-                sequence=request.record_sequence,
-                created_at=self.clock(),
-                record_id=self._new_record_id(),
+            return self._emit_transition_observation(
+                _runtime_result(
+                    request,
+                    status="not_enabled",
+                    blocked_reason="improvement runtime bridge is not enabled",
+                    record_kind="runtime_not_enabled",
+                    sequence=request.record_sequence,
+                    created_at=self.clock(),
+                    record_id=self._new_record_id(),
+                )
             )
         if request.collection_request is None:
-            return _runtime_result(
-                request,
-                status="blocked",
-                blocked_reason="evidence collection request is required",
-                record_kind="runtime_blocked",
-                sequence=request.record_sequence,
-                created_at=self.clock(),
-                record_id=self._new_record_id(),
+            return self._emit_transition_observation(
+                _runtime_result(
+                    request,
+                    status="blocked",
+                    blocked_reason="evidence collection request is required",
+                    record_kind="runtime_blocked",
+                    sequence=request.record_sequence,
+                    created_at=self.clock(),
+                    record_id=self._new_record_id(),
+                )
             )
 
         evidence_sources = request.evidence_sources or self.config.evidence_sources
         if not evidence_sources:
-            return _runtime_result(
-                request,
-                status="blocked",
-                blocked_reason="no improvement evidence source adapters were supplied",
-                record_kind="runtime_blocked",
-                sequence=request.record_sequence,
-                created_at=self.clock(),
-                record_id=self._new_record_id(),
+            return self._emit_transition_observation(
+                _runtime_result(
+                    request,
+                    status="blocked",
+                    blocked_reason="no improvement evidence source adapters were supplied",
+                    record_kind="runtime_blocked",
+                    sequence=request.record_sequence,
+                    created_at=self.clock(),
+                    record_id=self._new_record_id(),
+                )
             )
 
         evidence: list[ImprovementEvidence] = []
@@ -1147,7 +1621,10 @@ class ImprovementRuntimeBridge:
             },
             warnings=bounded.warnings,
             created_at=self.clock(),
-            metadata=request.metadata,
+            metadata=_runtime_record_metadata(
+                request.metadata,
+                request.permission_report,
+            ),
         )
         record_store = request.record_store or self.config.record_store
         if record_store is not None:
@@ -1166,19 +1643,22 @@ class ImprovementRuntimeBridge:
             warnings=bounded.warnings,
             metadata={"last_transition": "evidence_collected"},
         )
-        return ImprovementRuntimeTransitionResult(
-            request_id=request.request_id,
-            session_id=request.session_id,
-            runtime_session_id=request.runtime_session_id,
-            status="completed",
-            records=(record,),
-            summary=summary,
-            evidence=bounded.evidence,
-            warnings=bounded.warnings,
-            metadata={
-                "evidence_count": len(bounded.evidence),
-                "truncated": bounded.truncated,
-            },
+        return self._emit_transition_observation(
+            ImprovementRuntimeTransitionResult(
+                request_id=request.request_id,
+                session_id=request.session_id,
+                runtime_session_id=request.runtime_session_id,
+                status="completed",
+                records=(record,),
+                summary=summary,
+                evidence=bounded.evidence,
+                permission_report=request.permission_report,
+                warnings=bounded.warnings,
+                metadata={
+                    "evidence_count": len(bounded.evidence),
+                    "truncated": bounded.truncated,
+                },
+            )
         )
 
     def _new_record_id(self) -> str:
@@ -1192,6 +1672,32 @@ class ImprovementRuntimeBridge:
                 "record_id_factory returned an empty id"
             )
         return record_id
+
+    def _emit_transition_observation(
+        self,
+        result: ImprovementRuntimeTransitionResult,
+    ) -> ImprovementRuntimeTransitionResult:
+        sink = self.config.observability_sink
+        if sink is None:
+            return result
+        event = improvement_runtime_observability_event_from_result(result)
+        try:
+            sink.emit_transition(event)
+        except Exception as exc:  # pragma: no cover - exact exception is caller-owned.
+            warning = (
+                "improvement runtime observability observer failed: "
+                f"{type(exc).__name__}"
+            )
+            return replace(
+                result,
+                warnings=_bounded_string_tuple(
+                    (*result.warnings, warning),
+                    "ImprovementRuntimeTransitionResult.warnings",
+                    max_count=DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS,
+                    max_chars=DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNING_CHARS,
+                ),
+            )
+        return result
 
 
 def validate_improvement_evidence_collection(
@@ -1403,6 +1909,255 @@ def improvement_evidence_collection_result_from_dict(
     )
 
 
+def improvement_runtime_permission_requirement_to_dict(
+    requirement: ImprovementRuntimePermissionRequirement,
+) -> dict[str, object]:
+    return {
+        "stage_id": requirement.stage_id,
+        "record_kind": requirement.record_kind,
+        "required_permissions": list(requirement.required_permissions),
+        "reason": requirement.reason,
+        "source_record_id": requirement.source_record_id,
+        "metadata": _metadata_to_dict(requirement.metadata),
+    }
+
+
+def improvement_runtime_permission_requirement_from_dict(
+    data: Mapping[str, object],
+) -> ImprovementRuntimePermissionRequirement:
+    return ImprovementRuntimePermissionRequirement(
+        stage_id=str(data["stage_id"]),
+        record_kind=_optional_record_kind(data.get("record_kind")),
+        required_permissions=_permission_tuple(
+            _string_tuple(data.get("required_permissions", ()), "required_permissions"),
+            "required_permissions",
+            allow_empty=False,
+        ),
+        reason=_optional_str(data.get("reason")),
+        source_record_id=_optional_str(data.get("source_record_id")),
+        metadata=_metadata_from_object(data.get("metadata", {}), "metadata"),
+    )
+
+
+def improvement_runtime_permission_summary_to_dict(
+    summary: ImprovementRuntimePermissionSummary,
+) -> dict[str, object]:
+    return {
+        "stage_id": summary.stage_id,
+        "status": summary.status,
+        "required_permission_count": summary.required_permission_count,
+        "missing_permission_count": summary.missing_permission_count,
+        "extra_permission_count": summary.extra_permission_count,
+        "requirement_labels": list(summary.requirement_labels),
+    }
+
+
+def improvement_runtime_permission_summary_from_dict(
+    data: Mapping[str, object],
+) -> ImprovementRuntimePermissionSummary:
+    return ImprovementRuntimePermissionSummary(
+        stage_id=str(data["stage_id"]),
+        status=cast(
+            ImprovementRuntimePermissionStatus,
+            _literal_from_object(data["status"], _PERMISSION_STATUSES, "status"),
+        ),
+        required_permission_count=_int_from_object(
+            data["required_permission_count"],
+            "required_permission_count",
+        ),
+        missing_permission_count=_int_from_object(
+            data["missing_permission_count"],
+            "missing_permission_count",
+        ),
+        extra_permission_count=_int_from_object(
+            data["extra_permission_count"],
+            "extra_permission_count",
+        ),
+        requirement_labels=_string_tuple(
+            data.get("requirement_labels", ()),
+            "requirement_labels",
+        ),
+    )
+
+
+def improvement_runtime_permission_report_to_dict(
+    report: ImprovementRuntimePermissionReport,
+) -> dict[str, object]:
+    return {
+        "request_id": report.request_id,
+        "session_id": report.session_id,
+        "runtime_session_id": report.runtime_session_id,
+        "stage_id": report.stage_id,
+        "status": report.status,
+        "requirements": [
+            improvement_runtime_permission_requirement_to_dict(requirement)
+            for requirement in report.requirements
+        ],
+        "supplied_approved_permissions": list(report.supplied_approved_permissions),
+        "missing_permissions": list(report.missing_permissions),
+        "extra_permissions": list(report.extra_permissions),
+        "warnings": list(report.warnings),
+        "metadata": _metadata_to_dict(report.metadata),
+    }
+
+
+def improvement_runtime_permission_report_from_dict(
+    data: Mapping[str, object],
+) -> ImprovementRuntimePermissionReport:
+    return ImprovementRuntimePermissionReport(
+        request_id=str(data["request_id"]),
+        session_id=str(data["session_id"]),
+        runtime_session_id=_optional_str(data.get("runtime_session_id")),
+        stage_id=str(data["stage_id"]),
+        status=cast(
+            ImprovementRuntimePermissionStatus,
+            _literal_from_object(data["status"], _PERMISSION_STATUSES, "status"),
+        ),
+        requirements=tuple(
+            improvement_runtime_permission_requirement_from_dict(item)
+            for item in _mapping_sequence(data.get("requirements", ()), "requirements")
+        ),
+        supplied_approved_permissions=_permission_tuple(
+            _string_tuple(
+                data.get("supplied_approved_permissions", ()),
+                "supplied_approved_permissions",
+            ),
+            "supplied_approved_permissions",
+            allow_empty=True,
+        ),
+        missing_permissions=_permission_tuple(
+            _string_tuple(data.get("missing_permissions", ()), "missing_permissions"),
+            "missing_permissions",
+            allow_empty=True,
+        ),
+        extra_permissions=_permission_tuple(
+            _string_tuple(data.get("extra_permissions", ()), "extra_permissions"),
+            "extra_permissions",
+            allow_empty=True,
+        ),
+        warnings=_string_tuple(data.get("warnings", ()), "warnings"),
+        metadata=_metadata_from_object(data.get("metadata", {}), "metadata"),
+    )
+
+
+def improvement_runtime_permission_report_to_summary(
+    report: ImprovementRuntimePermissionReport,
+) -> ImprovementRuntimePermissionSummary:
+    labels = tuple(_permission_requirement_label(item) for item in report.requirements)
+    return ImprovementRuntimePermissionSummary(
+        stage_id=report.stage_id,
+        status=report.status,
+        required_permission_count=len(_permission_set_from_requirements(report.requirements)),
+        missing_permission_count=len(report.missing_permissions),
+        extra_permission_count=len(report.extra_permissions),
+        requirement_labels=labels,
+    )
+
+
+def improvement_runtime_observability_event_to_dict(
+    event: ImprovementRuntimeObservabilityEvent,
+) -> dict[str, object]:
+    return {
+        "request_id": event.request_id,
+        "session_id": event.session_id,
+        "runtime_session_id": event.runtime_session_id,
+        "status": event.status,
+        "record_ids": list(event.record_ids),
+        "last_record_kind": event.last_record_kind,
+        "evidence_count": event.evidence_count,
+        "warning_count": event.warning_count,
+        "truncated": event.truncated,
+        "stage_id": event.stage_id,
+        "permission_status": event.permission_status,
+        "permission_required_count": event.permission_required_count,
+        "permission_missing_count": event.permission_missing_count,
+        "permission_extra_count": event.permission_extra_count,
+    }
+
+
+def improvement_runtime_observability_event_from_dict(
+    data: Mapping[str, object],
+) -> ImprovementRuntimeObservabilityEvent:
+    permission_status = data.get("permission_status")
+    return ImprovementRuntimeObservabilityEvent(
+        request_id=str(data["request_id"]),
+        session_id=str(data["session_id"]),
+        runtime_session_id=_optional_str(data.get("runtime_session_id")),
+        status=cast(
+            ImprovementRuntimeTransitionStatus,
+            _literal_from_object(data["status"], _RUNTIME_TRANSITION_STATUSES, "status"),
+        ),
+        record_ids=_string_tuple(data.get("record_ids", ()), "record_ids"),
+        last_record_kind=_optional_record_kind(data.get("last_record_kind")),
+        evidence_count=_int_from_object(data["evidence_count"], "evidence_count"),
+        warning_count=_int_from_object(data["warning_count"], "warning_count"),
+        truncated=bool(data.get("truncated", False)),
+        stage_id=_optional_str(data.get("stage_id")),
+        permission_status=None
+        if permission_status is None
+        else cast(
+            ImprovementRuntimePermissionStatus,
+            _literal_from_object(
+                permission_status,
+                _PERMISSION_STATUSES,
+                "permission_status",
+            ),
+        ),
+        permission_required_count=_int_from_object(
+            data.get("permission_required_count", 0),
+            "permission_required_count",
+        ),
+        permission_missing_count=_int_from_object(
+            data.get("permission_missing_count", 0),
+            "permission_missing_count",
+        ),
+        permission_extra_count=_int_from_object(
+            data.get("permission_extra_count", 0),
+            "permission_extra_count",
+        ),
+    )
+
+
+def improvement_runtime_observability_event_from_result(
+    result: ImprovementRuntimeTransitionResult,
+) -> ImprovementRuntimeObservabilityEvent:
+    last_record = result.records[-1] if result.records else None
+    permission_summary = (
+        result.permission_report.to_summary()
+        if result.permission_report is not None
+        else None
+    )
+    truncated = result.metadata.get("truncated")
+    return ImprovementRuntimeObservabilityEvent(
+        request_id=result.request_id,
+        session_id=result.session_id,
+        runtime_session_id=result.runtime_session_id,
+        status=result.status,
+        record_ids=tuple(record.record_id for record in result.records),
+        last_record_kind=None if last_record is None else last_record.record_kind,
+        evidence_count=len(result.evidence),
+        warning_count=len(result.warnings),
+        truncated=truncated if isinstance(truncated, bool) else False,
+        stage_id=(
+            permission_summary.stage_id
+            if permission_summary is not None
+            else None if last_record is None else last_record.stage_id
+        ),
+        permission_status=None if permission_summary is None else permission_summary.status,
+        permission_required_count=(
+            0
+            if permission_summary is None
+            else permission_summary.required_permission_count
+        ),
+        permission_missing_count=(
+            0 if permission_summary is None else permission_summary.missing_permission_count
+        ),
+        permission_extra_count=(
+            0 if permission_summary is None else permission_summary.extra_permission_count
+        ),
+    )
+
+
 def _collection_result(
     request: ImprovementEvidenceCollectionRequest,
     *,
@@ -1567,7 +2322,7 @@ def _runtime_result(
         payload={"request_id": request.request_id, "status": status},
         stop_reason=blocked_reason,
         created_at=created_at,
-        metadata=request.metadata,
+        metadata=_runtime_record_metadata(request.metadata, request.permission_report),
     )
     summary = ImprovementRuntimeChainSummary(
         session_id=request.session_id,
@@ -1589,6 +2344,7 @@ def _runtime_result(
         summary=summary,
         warnings=(),
         blocked_reason=blocked_reason,
+        permission_report=request.permission_report,
     )
 
 
@@ -1676,6 +2432,141 @@ def _source_kind_tuple(
         tuple[ImprovementEvidenceSource, ...],
         tuple(_literal_from_object(value, _EVIDENCE_SOURCES, name) for value in values),
     )
+
+
+def _permission_tuple(
+    values: Sequence[str],
+    name: str,
+    *,
+    allow_empty: bool,
+) -> tuple[ImprovementRequiredPermission, ...]:
+    items = tuple(
+        cast(
+            ImprovementRequiredPermission,
+            _literal_from_object(item, _REQUIRED_PERMISSIONS, name),
+        )
+        for item in values
+    )
+    if not allow_empty and not items:
+        raise ImprovementRuntimeValidationError(f"{name} must not be empty")
+    duplicate_items = sorted(item for item in set(items) if items.count(item) > 1)
+    if duplicate_items:
+        joined = ", ".join(duplicate_items)
+        raise ImprovementRuntimeValidationError(f"{name} contains duplicates: {joined}")
+    if "none" in items and len(items) > 1:
+        raise ImprovementRuntimeValidationError(f"{name} cannot mix none")
+    return cast(tuple[ImprovementRequiredPermission, ...], items)
+
+
+def _permission_set_from_requirements(
+    requirements: Sequence[ImprovementRuntimePermissionRequirement],
+) -> set[str]:
+    result: set[str] = set()
+    for requirement in requirements:
+        result.update(requirement.required_permissions)
+    return result
+
+
+def _missing_permissions(
+    required: set[str],
+    supplied: Sequence[ImprovementRequiredPermission],
+) -> tuple[ImprovementRequiredPermission, ...]:
+    return _sorted_permission_tuple(required.difference(supplied))
+
+
+def _extra_permissions(
+    supplied: Sequence[ImprovementRequiredPermission],
+    required: set[str],
+) -> tuple[ImprovementRequiredPermission, ...]:
+    return _sorted_permission_tuple(set(supplied).difference(required))
+
+
+def _sorted_permission_tuple(
+    values: Iterable[str],
+) -> tuple[ImprovementRequiredPermission, ...]:
+    return cast(tuple[ImprovementRequiredPermission, ...], tuple(sorted(values)))
+
+
+def _permission_requirement_label(
+    requirement: ImprovementRuntimePermissionRequirement,
+) -> str:
+    if requirement.record_kind is None:
+        return requirement.stage_id
+    return f"{requirement.stage_id}:{requirement.record_kind}"
+
+
+def _runtime_record_metadata(
+    metadata: Mapping[str, FrozenJson],
+    permission_report: ImprovementRuntimePermissionReport | None,
+) -> Mapping[str, FrozenJson]:
+    _reject_unsafe_runtime_permission_metadata(
+        metadata,
+        "ImprovementRuntimeRequest.metadata",
+        allow_permission_summary=False,
+    )
+    data = _metadata_to_dict(metadata)
+    if permission_report is not None:
+        data["permission_summary"] = improvement_runtime_permission_summary_to_dict(
+            permission_report.to_summary()
+        )
+    return _freeze_metadata(
+        data,
+        "ImprovementRuntimeRecord.metadata",
+        DEFAULT_MAX_IMPROVEMENT_RUNTIME_METADATA_CHARS,
+    )
+
+
+def _reject_unsafe_runtime_permission_metadata(
+    value: object,
+    name: str,
+    *,
+    allow_permission_summary: bool,
+) -> None:
+    if isinstance(value, Mapping):
+        for key, item in cast(Mapping[object, object], value).items():
+            key_text = str(key)
+            child_name = f"{name}.{key_text}"
+            if key_text == "permission_summary" and allow_permission_summary:
+                _validate_permission_summary_metadata(item, child_name)
+                continue
+            if key_text in _UNSAFE_RUNTIME_PERMISSION_METADATA_KEYS:
+                raise ImprovementRuntimeValidationError(
+                    f"{child_name} is reserved for sanitized permission summaries"
+                )
+            _reject_unsafe_runtime_permission_metadata(
+                item,
+                child_name,
+                allow_permission_summary=allow_permission_summary,
+            )
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        for index, item in enumerate(cast(Sequence[object], value)):
+            _reject_unsafe_runtime_permission_metadata(
+                item,
+                f"{name}[{index}]",
+                allow_permission_summary=allow_permission_summary,
+            )
+
+
+def _validate_permission_summary_metadata(value: object, name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ImprovementRuntimeValidationError(
+            f"{name} must be a sanitized permission summary"
+        )
+    mapping = cast(Mapping[object, object], value)
+    keys = {str(key) for key in mapping}
+    expected = {
+        "stage_id",
+        "status",
+        "required_permission_count",
+        "missing_permission_count",
+        "extra_permission_count",
+        "requirement_labels",
+    }
+    if keys != expected:
+        raise ImprovementRuntimeValidationError(
+            f"{name} must be a sanitized permission summary"
+        )
+    improvement_runtime_permission_summary_from_dict(cast(Mapping[str, object], value))
 
 
 def _bounded_string_tuple(
@@ -1828,6 +2719,13 @@ __all__ = (
     "ImprovementRuntimeBridge",
     "ImprovementRuntimeBridgeConfig",
     "ImprovementRuntimeChainSummary",
+    "ImprovementRuntimeObservabilityEvent",
+    "ImprovementRuntimeObservabilitySink",
+    "ImprovementRuntimePermissionPolicy",
+    "ImprovementRuntimePermissionReport",
+    "ImprovementRuntimePermissionRequirement",
+    "ImprovementRuntimePermissionStatus",
+    "ImprovementRuntimePermissionSummary",
     "ImprovementRuntimeRecord",
     "ImprovementRuntimeRecordKind",
     "ImprovementRuntimeRecordQuery",
@@ -1837,6 +2735,7 @@ __all__ = (
     "ImprovementRuntimeValidationError",
     "ImprovementTaskOutputEvidenceTarget",
     "ImprovementTaskOutputReadMode",
+    "KernelEventImprovementRuntimeObserver",
     "ObservabilitySnapshotImprovementEvidenceAdapter",
     "TaskOutputImprovementEvidenceAdapter",
     "TranscriptSearchImprovementEvidenceAdapter",
@@ -1844,6 +2743,16 @@ __all__ = (
     "improvement_evidence_collection_result_to_dict",
     "improvement_runtime_chain_summary_from_dict",
     "improvement_runtime_chain_summary_to_dict",
+    "improvement_runtime_observability_event_from_dict",
+    "improvement_runtime_observability_event_from_result",
+    "improvement_runtime_observability_event_to_dict",
+    "improvement_runtime_permission_report_from_dict",
+    "improvement_runtime_permission_report_to_dict",
+    "improvement_runtime_permission_report_to_summary",
+    "improvement_runtime_permission_requirement_from_dict",
+    "improvement_runtime_permission_requirement_to_dict",
+    "improvement_runtime_permission_summary_from_dict",
+    "improvement_runtime_permission_summary_to_dict",
     "improvement_runtime_record_from_dict",
     "improvement_runtime_record_to_dict",
     "validate_improvement_evidence_collection",

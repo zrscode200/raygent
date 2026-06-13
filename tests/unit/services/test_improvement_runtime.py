@@ -11,7 +11,18 @@ import pytest
 
 import raygent_harness.services.improvement_runtime as runtime_module
 from raygent_harness.core.model_types import FrozenJson
-from raygent_harness.improvement import ImprovementEvidence, ImprovementEvidenceBounds
+from raygent_harness.core.observability import KernelEvent, KernelEventBus
+from raygent_harness.improvement import (
+    ImprovementEvaluationCheck,
+    ImprovementEvaluationPlan,
+    ImprovementEvidence,
+    ImprovementEvidenceBounds,
+    ImprovementPatchCandidatePlan,
+    ImprovementPatchCandidateWorktreeAllocator,
+    ImprovementPatchCandidateWorktreeApproval,
+    ImprovementPatchCandidateWorktreeValidationError,
+    ImprovementTarget,
+)
 from raygent_harness.services.improvement_runtime import (
     DEFAULT_MAX_EVIDENCE_COLLECTION_EXCERPT_CHARS,
     DEFAULT_MAX_EVIDENCE_COLLECTION_ITEM_METADATA_CHARS,
@@ -26,12 +37,18 @@ from raygent_harness.services.improvement_runtime import (
     ImprovementRuntimeBridge,
     ImprovementRuntimeBridgeConfig,
     ImprovementRuntimeChainSummary,
+    ImprovementRuntimeObservabilityEvent,
+    ImprovementRuntimeObservabilitySink,
+    ImprovementRuntimePermissionPolicy,
+    ImprovementRuntimePermissionReport,
+    ImprovementRuntimePermissionRequirement,
     ImprovementRuntimeRecord,
     ImprovementRuntimeRecordQuery,
     ImprovementRuntimeRequest,
     ImprovementRuntimeTransitionResult,
     ImprovementRuntimeValidationError,
     ImprovementTaskOutputEvidenceTarget,
+    KernelEventImprovementRuntimeObserver,
     ObservabilitySnapshotImprovementEvidenceAdapter,
     TaskOutputImprovementEvidenceAdapter,
     TranscriptSearchImprovementEvidenceAdapter,
@@ -39,6 +56,11 @@ from raygent_harness.services.improvement_runtime import (
     improvement_evidence_collection_result_to_dict,
     improvement_runtime_chain_summary_from_dict,
     improvement_runtime_chain_summary_to_dict,
+    improvement_runtime_observability_event_from_dict,
+    improvement_runtime_observability_event_to_dict,
+    improvement_runtime_permission_report_from_dict,
+    improvement_runtime_permission_report_to_dict,
+    improvement_runtime_permission_summary_to_dict,
     improvement_runtime_record_from_dict,
     improvement_runtime_record_to_dict,
     validate_improvement_evidence_collection,
@@ -53,6 +75,11 @@ from raygent_harness.services.transcript import (
     TranscriptSearchRequest,
     TranscriptSearchResult,
     TranscriptSearchService,
+)
+from raygent_harness.services.worktree.manager import WorktreeManager
+from raygent_harness.services.worktree.models import (
+    WorktreeCleanupResult,
+    WorktreeInfo,
 )
 
 
@@ -175,6 +202,70 @@ class ReplacingRecordStore(FakeRecordStore):
         return replace(record, session_id="other-session")
 
 
+def _empty_observability_events() -> list[ImprovementRuntimeObservabilityEvent]:
+    return []
+
+
+@dataclass
+class FakeImprovementRuntimeObserver:
+    events: list[ImprovementRuntimeObservabilityEvent] = field(
+        default_factory=_empty_observability_events
+    )
+    fail: bool = False
+
+    def emit_transition(self, event: ImprovementRuntimeObservabilityEvent) -> None:
+        if self.fail:
+            raise RuntimeError("observer unavailable")
+        self.events.append(event)
+
+
+def _empty_kernel_events() -> list[KernelEvent]:
+    return []
+
+
+@dataclass
+class CapturingKernelEventSink:
+    events: list[KernelEvent] = field(default_factory=_empty_kernel_events)
+
+    def emit(self, event: KernelEvent) -> None:
+        self.events.append(event)
+
+
+def _empty_worktree_calls() -> list[tuple[str, str]]:
+    return []
+
+
+@dataclass
+class FakeWorktreeManager:
+    create_calls: list[tuple[str, str]] = field(default_factory=_empty_worktree_calls)
+
+    async def create_agent_worktree(self, slug: str, *, cwd: str) -> WorktreeInfo:
+        self.create_calls.append((slug, cwd))
+        return WorktreeInfo(
+            path=f"/tmp/raygent/{slug}",
+            branch=f"worktree-{slug}",
+            head_commit="base-1",
+            git_root="/repo",
+            slug=slug,
+            created_at=111.0,
+            touched_at=112.0,
+            cleanup_policy="remove_if_clean",
+        )
+
+    async def has_changes(self, info: WorktreeInfo) -> bool:
+        _ = info
+        return False
+
+    async def cleanup(
+        self,
+        info: WorktreeInfo,
+        *,
+        keep: bool | None = None,
+    ) -> WorktreeCleanupResult:
+        _ = (info, keep)
+        return WorktreeCleanupResult(kept=False, reason="removed")
+
+
 def _empty_search_requests() -> list[TranscriptSearchRequest]:
     return []
 
@@ -258,6 +349,53 @@ def _empty_task_output(task_id: str) -> TaskOutputReadResult:
         bytes_read=0,
         bytes_total=0,
         next_offset=0,
+    )
+
+
+def _runtime_improvement_target() -> ImprovementTarget:
+    return ImprovementTarget(
+        target_id="src/raygent_harness/services/improvement_runtime.py",
+        kind="source_code",
+        description="Improvement runtime permission bridge",
+    )
+
+
+def _runtime_evaluation_plan() -> ImprovementEvaluationPlan:
+    return ImprovementEvaluationPlan(
+        checks=(
+            ImprovementEvaluationCheck(
+                name="improvement-runtime",
+                instruction="Verify runtime bridge behavior.",
+            ),
+        ),
+        success_criteria=("Runtime bridge behavior is bounded.",),
+    )
+
+
+def _runtime_candidate_plan() -> ImprovementPatchCandidatePlan:
+    return ImprovementPatchCandidatePlan(
+        candidate_id="ipc_runtime",
+        run_id="ir_1",
+        proposal_id="ip_1",
+        gate_evaluation_id="ige_1",
+        target=_runtime_improvement_target(),
+        base_revision="base-1",
+        summary="Plan runtime bridge work.",
+        planned_changes=("Add permission bridge behavior.",),
+        expected_files=("src/raygent_harness/services/improvement_runtime.py",),
+        required_permissions=("filesystem_mutation", "worktree"),
+        evaluation_plan=_runtime_evaluation_plan(),
+        rollback_plan="Discard the candidate worktree.",
+    )
+
+
+def _permission_summary_metadata(
+    report: ImprovementRuntimePermissionReport,
+) -> Mapping[str, FrozenJson]:
+    summary = report.to_summary()
+    return cast(
+        Mapping[str, FrozenJson],
+        {"permission_summary": improvement_runtime_permission_summary_to_dict(summary)},
     )
 
 
@@ -757,6 +895,250 @@ def test_runtime_chain_summary_round_trips() -> None:
     assert improvement_runtime_chain_summary_from_dict(snapshot) == summary
 
 
+def test_permission_requirement_and_policy_report_advisory_statuses() -> None:
+    requirement = ImprovementRuntimePermissionRequirement(
+        stage_id="verification",
+        record_kind="verification_recorded",
+        required_permissions=("filesystem_mutation", "shell"),
+        reason="verification runner would need local shell access",
+        metadata={"source": "verification-plan"},
+    )
+    policy = ImprovementRuntimePermissionPolicy()
+
+    required = policy.evaluate(
+        request_id="irt_1",
+        session_id="session-1",
+        runtime_session_id="runtime-1",
+        stage_id="verification",
+        requirements=(requirement,),
+    )
+    approved = policy.evaluate(
+        request_id="irt_1",
+        session_id="session-1",
+        runtime_session_id="runtime-1",
+        stage_id="verification",
+        requirements=(requirement,),
+        approved_permissions=("filesystem_mutation", "shell"),
+    )
+    blocked = policy.evaluate(
+        request_id="irt_1",
+        session_id="session-1",
+        runtime_session_id="runtime-1",
+        stage_id="verification",
+        requirements=(requirement,),
+        approved_permissions=("filesystem_mutation", "shell", "commit"),
+    )
+    not_required = policy.evaluate(
+        request_id="irt_1",
+        session_id="session-1",
+        runtime_session_id="runtime-1",
+        stage_id="observe",
+        requirements=(
+            ImprovementRuntimePermissionRequirement(
+                stage_id="observe",
+                required_permissions=("none",),
+            ),
+        ),
+    )
+
+    assert required.status == "required"
+    assert required.missing_permissions == ("filesystem_mutation", "shell")
+    assert approved.status == "approved"
+    assert blocked.status == "blocked"
+    assert blocked.extra_permissions == ("commit",)
+    assert not_required.status == "not_required"
+
+    snapshot = improvement_runtime_permission_report_to_dict(approved)
+    json.dumps(snapshot)
+
+    assert improvement_runtime_permission_report_from_dict(snapshot) == approved
+
+
+def test_permission_requirement_rejects_duplicates_and_none_mixing() -> None:
+    with pytest.raises(ImprovementRuntimeValidationError, match="duplicates"):
+        ImprovementRuntimePermissionRequirement(
+            stage_id="verification",
+            required_permissions=("shell", "shell"),
+        )
+
+    with pytest.raises(ImprovementRuntimeValidationError, match="cannot mix none"):
+        ImprovementRuntimePermissionRequirement(
+            stage_id="verification",
+            required_permissions=("none", "shell"),
+        )
+
+
+def test_permission_report_summary_omits_approval_adjacent_facts() -> None:
+    report = ImprovementRuntimePermissionPolicy().evaluate(
+        request_id="irt_1",
+        session_id="session-1",
+        runtime_session_id="runtime-1",
+        stage_id="archive",
+        requirements=(
+            ImprovementRuntimePermissionRequirement(
+                stage_id="archive",
+                record_kind="archive_recorded",
+                required_permissions=("filesystem_mutation",),
+                reason="archive persistence needs a caller-owned store",
+                metadata={"caller_note": "return-only report metadata"},
+            ),
+        ),
+        approved_permissions=("filesystem_mutation", "commit"),
+        metadata={"approver_identity": "return-only, not durable metadata"},
+    )
+
+    summary = report.to_summary()
+    snapshot = improvement_runtime_permission_summary_to_dict(summary)
+    serialized = json.dumps(snapshot)
+
+    assert summary.status == "blocked"
+    assert summary.required_permission_count == 1
+    assert summary.missing_permission_count == 0
+    assert summary.extra_permission_count == 1
+    assert summary.requirement_labels == ("archive:archive_recorded",)
+    assert "filesystem_mutation" not in serialized
+    assert "commit" not in serialized
+    assert "approver_identity" not in serialized
+    assert "caller_note" not in serialized
+
+
+def test_runtime_record_rejects_direct_full_permission_report_metadata() -> None:
+    report = ImprovementRuntimePermissionPolicy().evaluate(
+        request_id="irt_1",
+        session_id="session-1",
+        stage_id="verification",
+        requirements=(
+            ImprovementRuntimePermissionRequirement(
+                stage_id="verification",
+                required_permissions=("filesystem_mutation", "shell"),
+            ),
+        ),
+        approved_permissions=("filesystem_mutation", "shell"),
+        metadata={"approver_identity": "operator-a"},
+    )
+
+    with pytest.raises(ImprovementRuntimeValidationError, match="permission_report"):
+        ImprovementRuntimeRecord(
+            record_id="irtr_1",
+            record_kind="runtime_blocked",
+            session_id="session-1",
+            sequence=1,
+            payload={"request_id": "irt_1", "status": "blocked"},
+            metadata=cast(
+                Mapping[str, FrozenJson],
+                {
+                    "permission_report": improvement_runtime_permission_report_to_dict(
+                        report
+                    )
+                },
+            ),
+        )
+
+    with pytest.raises(ImprovementRuntimeValidationError, match="permission_summary"):
+        ImprovementRuntimeRecord(
+            record_id="irtr_2",
+            record_kind="runtime_blocked",
+            session_id="session-1",
+            sequence=1,
+            payload={"request_id": "irt_1", "status": "blocked"},
+            metadata=cast(
+                Mapping[str, FrozenJson],
+                {
+                    "permission_summary": {
+                        "stage_id": "verification",
+                        "status": "approved",
+                        "supplied_approved_permissions": (
+                            "filesystem_mutation",
+                            "shell",
+                        ),
+                    }
+                },
+            ),
+        )
+
+    record = ImprovementRuntimeRecord(
+        record_id="irtr_3",
+        record_kind="runtime_blocked",
+        session_id="session-1",
+        sequence=1,
+        payload={"request_id": "irt_1", "status": "blocked"},
+        metadata=_permission_summary_metadata(report),
+    )
+
+    assert record.metadata["permission_summary"] == {
+        "stage_id": "verification",
+        "status": "approved",
+        "required_permission_count": 2,
+        "missing_permission_count": 0,
+        "extra_permission_count": 0,
+        "requirement_labels": ("verification",),
+    }
+
+
+@pytest.mark.asyncio
+async def test_permission_report_is_advisory_not_stage_authorization() -> None:
+    plan = _runtime_candidate_plan()
+    manager = FakeWorktreeManager()
+    report_with_extra = ImprovementRuntimePermissionPolicy().evaluate(
+        request_id="irt_1",
+        session_id="session-1",
+        stage_id="worktree",
+        requirements=(
+            ImprovementRuntimePermissionRequirement(
+                stage_id="worktree",
+                record_kind="worktree_allocated",
+                required_permissions=("filesystem_mutation", "worktree"),
+            ),
+        ),
+        approved_permissions=("filesystem_mutation", "worktree", "commit"),
+    )
+
+    assert report_with_extra.status == "blocked"
+
+    allocation = await ImprovementPatchCandidateWorktreeAllocator(
+        allocation_id_factory=lambda: "ipcw_1",
+    ).allocate(
+        plan,
+        manager=cast(WorktreeManager, manager),
+        cwd="/repo",
+        approval=ImprovementPatchCandidateWorktreeApproval(
+            approved_permissions=("filesystem_mutation", "worktree", "commit"),
+            reason="stage approval permits valid extras for this stage",
+        ),
+        metadata=_permission_summary_metadata(report_with_extra),
+    )
+
+    assert allocation.status == "allocated"
+    assert manager.create_calls == [(allocation.worktree_slug, "/repo")]
+
+    approved_report = ImprovementRuntimePermissionPolicy().evaluate(
+        request_id="irt_2",
+        session_id="session-1",
+        stage_id="worktree",
+        requirements=(
+            ImprovementRuntimePermissionRequirement(
+                stage_id="worktree",
+                record_kind="worktree_allocated",
+                required_permissions=("filesystem_mutation", "worktree"),
+            ),
+        ),
+        approved_permissions=("filesystem_mutation", "worktree"),
+    )
+
+    assert approved_report.status == "approved"
+    with pytest.raises(
+        ImprovementPatchCandidateWorktreeValidationError,
+        match="call-time approval",
+    ):
+        await ImprovementPatchCandidateWorktreeAllocator().allocate(
+            plan,
+            manager=cast(WorktreeManager, FakeWorktreeManager()),
+            cwd="/repo",
+            approval=None,
+            metadata=_permission_summary_metadata(approved_report),
+        )
+
+
 @pytest.mark.asyncio
 async def test_bridge_default_disabled_returns_not_enabled_without_adapters() -> None:
     result = await ImprovementRuntimeBridge(
@@ -828,6 +1210,216 @@ async def test_bridge_collects_via_injected_adapter_and_store_only() -> None:
     assert result.summary.last_record_kind == "evidence_collected"
     assert adapter.requests == [_collection_request()]
     assert store.records == [result.records[0]]
+
+
+@pytest.mark.asyncio
+async def test_bridge_returns_permission_report_but_stores_only_sanitized_summary() -> None:
+    adapter = FakeEvidenceSource()
+    store = FakeRecordStore()
+    permission_report = ImprovementRuntimePermissionPolicy().evaluate(
+        request_id="irt_1",
+        session_id="session-1",
+        runtime_session_id="runtime-1",
+        stage_id="verification",
+        requirements=(
+            ImprovementRuntimePermissionRequirement(
+                stage_id="verification",
+                record_kind="verification_recorded",
+                required_permissions=("filesystem_mutation", "shell"),
+                reason="verification runner requires explicit local approval",
+                metadata={"return_only": "requirement metadata"},
+            ),
+        ),
+        approved_permissions=("filesystem_mutation", "shell", "commit"),
+        metadata={"approver_identity": "operator-a"},
+    )
+
+    result = await ImprovementRuntimeBridge(
+        ImprovementRuntimeBridgeConfig(enabled=True, record_store=store),
+        clock=lambda: 300.0,
+        record_id_factory=lambda: "irtr_evidence",
+    ).collect_evidence(
+        ImprovementRuntimeRequest(
+            request_id="irt_1",
+            session_id="session-1",
+            runtime_session_id="runtime-1",
+            collection_request=_collection_request(),
+            evidence_sources=(adapter,),
+            permission_report=permission_report,
+            metadata={"caller": "unit-test"},
+        )
+    )
+
+    assert result.permission_report == permission_report
+    report = result.permission_report
+    assert report is not None
+    assert report.supplied_approved_permissions == (
+        "filesystem_mutation",
+        "shell",
+        "commit",
+    )
+    metadata = result.records[0].metadata
+    assert metadata["caller"] == "unit-test"
+    assert metadata["permission_summary"] == {
+        "stage_id": "verification",
+        "status": "blocked",
+        "required_permission_count": 2,
+        "missing_permission_count": 0,
+        "extra_permission_count": 1,
+        "requirement_labels": ("verification:verification_recorded",),
+    }
+    serialized_metadata = json.dumps(
+        improvement_runtime_record_to_dict(result.records[0])["metadata"]
+    )
+    assert "supplied_approved_permissions" not in serialized_metadata
+    assert "approver_identity" not in serialized_metadata
+    assert "filesystem_mutation" not in serialized_metadata
+    assert "commit" not in serialized_metadata
+
+
+@pytest.mark.asyncio
+async def test_bridge_rejects_permission_report_smuggling_in_record_metadata() -> None:
+    with pytest.raises(ImprovementRuntimeValidationError, match="approved_permissions"):
+        await ImprovementRuntimeBridge(
+            ImprovementRuntimeBridgeConfig(enabled=True),
+            record_id_factory=lambda: "irtr_evidence",
+        ).collect_evidence(
+            ImprovementRuntimeRequest(
+                request_id="irt_1",
+                session_id="session-1",
+                runtime_session_id="runtime-1",
+                collection_request=_collection_request(),
+                evidence_sources=(FakeEvidenceSource(),),
+                metadata={
+                    "nested": {
+                        "approved_permissions": (
+                            "filesystem_mutation",
+                            "shell",
+                        )
+                    }
+                },
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_bridge_emits_metadata_only_observability_event() -> None:
+    observer = FakeImprovementRuntimeObserver()
+    permission_report = ImprovementRuntimePermissionPolicy().evaluate(
+        request_id="irt_1",
+        session_id="session-1",
+        runtime_session_id="runtime-1",
+        stage_id="observe",
+        requirements=(
+            ImprovementRuntimePermissionRequirement(
+                stage_id="observe",
+                required_permissions=("none",),
+            ),
+        ),
+    )
+
+    result = await ImprovementRuntimeBridge(
+        ImprovementRuntimeBridgeConfig(
+            enabled=True,
+            observability_sink=cast(ImprovementRuntimeObservabilitySink, observer),
+        ),
+        record_id_factory=lambda: "irtr_evidence",
+    ).collect_evidence(
+        ImprovementRuntimeRequest(
+            request_id="irt_1",
+            session_id="session-1",
+            runtime_session_id="runtime-1",
+            collection_request=_collection_request(),
+            evidence_sources=(FakeEvidenceSource(),),
+            permission_report=permission_report,
+        )
+    )
+
+    assert result.status == "completed"
+    assert observer.events == (
+        [
+            ImprovementRuntimeObservabilityEvent(
+                request_id="irt_1",
+                session_id="session-1",
+                runtime_session_id="runtime-1",
+                status="completed",
+                record_ids=("irtr_evidence",),
+                last_record_kind="evidence_collected",
+                evidence_count=1,
+                warning_count=1,
+                truncated=True,
+                stage_id="observe",
+                permission_status="not_required",
+                permission_required_count=1,
+                permission_missing_count=0,
+                permission_extra_count=0,
+            )
+        ]
+    )
+    snapshot = improvement_runtime_observability_event_to_dict(observer.events[0])
+    assert improvement_runtime_observability_event_from_dict(snapshot) == observer.events[0]
+    serialized = json.dumps(snapshot)
+    assert "bounded transcript excerpt" not in serialized
+    assert "source_uri" not in serialized
+    assert "prompt" not in serialized
+    assert "tool_result" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_bridge_observability_failures_are_warnings_not_status_changes() -> None:
+    observer = FakeImprovementRuntimeObserver(fail=True)
+
+    result = await ImprovementRuntimeBridge(
+        ImprovementRuntimeBridgeConfig(
+            enabled=True,
+            observability_sink=cast(ImprovementRuntimeObservabilitySink, observer),
+        ),
+        record_id_factory=lambda: "irtr_evidence",
+    ).collect_evidence(
+        ImprovementRuntimeRequest(
+            request_id="irt_1",
+            session_id="session-1",
+            runtime_session_id="runtime-1",
+            collection_request=_collection_request(),
+            evidence_sources=(FakeEvidenceSource(),),
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.warnings[-1] == (
+        "improvement runtime observability observer failed: RuntimeError"
+    )
+
+
+def test_kernel_event_observer_emits_metadata_only_bus_event() -> None:
+    sink = CapturingKernelEventSink()
+    bus = KernelEventBus((sink,), clock=lambda: 500.0, id_factory=lambda seq: f"ev_{seq}")
+    observer = KernelEventImprovementRuntimeObserver(bus)
+
+    observer.emit_transition(
+        ImprovementRuntimeObservabilityEvent(
+            request_id="irt_1",
+            session_id="session-1",
+            runtime_session_id="runtime-1",
+            status="blocked",
+            record_ids=("irtr_blocked",),
+            last_record_kind="runtime_blocked",
+            warning_count=1,
+            stage_id="verification",
+            permission_status="required",
+            permission_required_count=2,
+            permission_missing_count=2,
+        )
+    )
+
+    assert len(sink.events) == 1
+    event = sink.events[0]
+    assert event.type == "improvement_runtime.transition"
+    assert event.content_policy == "metadata_only"
+    assert event.session_id == "session-1"
+    assert event.runtime_session_id == "runtime-1"
+    assert event.data["record_ids"] == ("irtr_blocked",)
+    assert event.data["permission_status"] == "required"
 
 
 @pytest.mark.asyncio
