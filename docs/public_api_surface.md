@@ -654,8 +654,8 @@ Optional improvement runtime bridge:
   - optional runtime bridge contracts for explicit caller invocation only
   - versioned immutable improvement-chain envelopes with bounded metadata,
     warnings, stop reasons, payloads, and payload references
-  - bounded recovery-summary records for product-layer and recovery decisions,
-    without integrating `RuntimeRecoveryService` yet
+  - bounded recovery-summary records and read-only recovery results for
+    product-layer and runtime-recovery decisions
   - injectable evidence source adapters and an injectable record-store protocol
     that are absent by default
   - `IMPROVEMENT_RUNTIME_RECORD_SCHEMA_VERSION`
@@ -692,6 +692,10 @@ Optional improvement runtime bridge:
   - `ImprovementRuntimeObservabilityEvent`
   - `ImprovementRuntimeObservabilitySink`
   - `KernelEventImprovementRuntimeObserver`
+  - `ImprovementRuntimeRecoveryRequest`
+  - `ImprovementRuntimeRecoveryResult`
+  - `ImprovementRuntimeRecoveryService`
+  - `ImprovementRuntimeRecoveryStatus`
   - `ImprovementRecordStore`
   - `ImprovementRuntimeBridge`
   - `ImprovementRuntimeBridgeConfig`
@@ -716,10 +720,13 @@ Optional improvement runtime bridge:
   - `improvement_runtime_observability_event_to_dict(...)`
   - `improvement_runtime_observability_event_from_dict(...)`
   - `improvement_runtime_observability_event_from_result(...)`
+  - `improvement_runtime_recovery_result_to_dict(...)`
+  - `improvement_runtime_recovery_result_from_dict(...)`
   - `improvement_runtime_record_to_dict(...)`
   - `improvement_runtime_record_from_dict(...)`
   - `improvement_runtime_chain_summary_to_dict(...)`
   - `improvement_runtime_chain_summary_from_dict(...)`
+  - `recover_improvement_runtime_chain(...)`
 
 `raygent_harness.services.improvement_runtime` is the RSI-006 service-layer
 contract surface. `ImprovementRuntimeBridge` is inert unless a caller constructs
@@ -758,9 +765,20 @@ can emit explicit bridge transitions through `KernelEventBus` with
 statuses, counts, and sanitized permission summary counts. Runtime records use
 `IMPROVEMENT_RUNTIME_RECORD_SCHEMA_VERSION` and bounded metadata so future
 stores and recovery code can summarize where an explicit improvement chain
-stopped and what record or permission is required next. RSI-006 does not modify `QueryEngine`,
-`create_raygent(...)`, `RaygentFactory`, `GoalRuntime`, or product `/goal` behavior,
-and does not invoke Raygent tools.
+stopped and what record or permission is required next.
+`ImprovementRuntimeRecoveryService` and
+`recover_improvement_runtime_chain(...)` load only bounded records from an
+injected `ImprovementRecordStore`; they never call `append_record(...)`, never
+read transcript or task-output bodies, never replay mutation-capable stages,
+and can distinguish the last stored record from the last completed record.
+When supplied to `RuntimeRecoveryService`, improvement recovery is optional and
+read-only: partial inputs create
+`RuntimeRecoveryWarning(source="improvement_runtime", ...)`, recovered records
+and summaries must match the adopted transcript session id, and the
+`runtime_recovery.completed` event emits only metadata counts and booleans.
+Recovered permission summaries remain advisory and are not durable approvals.
+RSI-006 does not modify `QueryEngine`, `create_raygent(...)`, `RaygentFactory`,
+`GoalRuntime`, or product `/goal` behavior, and does not invoke Raygent tools.
 
 Worktrees and remote-agent seam:
 

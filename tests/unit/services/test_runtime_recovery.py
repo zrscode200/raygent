@@ -26,6 +26,11 @@ from raygent_harness.core.task import (
 )
 from raygent_harness.core.tool import QueryTracking, ToolUseContext
 from raygent_harness.services.agent_routes import JsonAgentRouteRecordStore
+from raygent_harness.services.improvement_runtime import (
+    ImprovementRuntimeChainSummary,
+    ImprovementRuntimeRecord,
+    ImprovementRuntimeRecordQuery,
+)
 from raygent_harness.services.remote_agent import (
     JsonRemoteAgentPersistenceStore,
     RemoteAgentLaunchRequest,
@@ -126,6 +131,63 @@ class _FailingEnqueueTaskStore(AppStateStore):
     def enqueue_notification(self, notification: TaskNotification) -> bool:
         _ = notification
         raise RuntimeError("enqueue unavailable")
+
+
+class _ImprovementRecordStore:
+    def __init__(self, records: Sequence[ImprovementRuntimeRecord] = ()) -> None:
+        self.records = list(records)
+        self.append_calls: list[ImprovementRuntimeRecord] = []
+
+    async def append_record(
+        self,
+        record: ImprovementRuntimeRecord,
+    ) -> ImprovementRuntimeRecord:
+        self.append_calls.append(record)
+        raise AssertionError("runtime recovery must not append improvement records")
+
+    async def load_records(
+        self,
+        query: ImprovementRuntimeRecordQuery,
+    ) -> tuple[ImprovementRuntimeRecord, ...]:
+        return tuple(
+            record
+            for record in self.records
+            if _improvement_record_matches_query(record, query)
+        )
+
+    async def summarize_chain(
+        self,
+        query: ImprovementRuntimeRecordQuery,
+    ) -> ImprovementRuntimeChainSummary | None:
+        records = await self.load_records(query)
+        if not records:
+            return None
+        last = sorted(records, key=lambda item: item.sequence)[-1]
+        return ImprovementRuntimeChainSummary(
+            session_id=last.session_id,
+            runtime_session_id=last.runtime_session_id,
+            run_id=last.run_id,
+            record_count=len(records),
+            status="completed",
+            last_record_id=last.record_id,
+            last_sequence=last.sequence,
+            last_record_kind=last.record_kind,
+        )
+
+
+def _improvement_record_matches_query(
+    record: ImprovementRuntimeRecord,
+    query: ImprovementRuntimeRecordQuery,
+) -> bool:
+    for field_name, expected in (
+        ("session_id", query.session_id),
+        ("run_id", query.run_id),
+        ("proposal_id", query.proposal_id),
+        ("candidate_id", query.candidate_id),
+    ):
+        if expected is not None and getattr(record, field_name) != expected:
+            return False
+    return True
 
 
 def _ctx(
@@ -397,6 +459,156 @@ async def test_resume_runtime_session_restores_state_and_rebinds_next_turn(
     assert completed_events[0].data["offline_task_notification_count"] == 1
     assert completed_events[0].data["replayed_task_notification_count"] == 1
     assert "before" not in str(completed_events[0].data)
+
+
+@pytest.mark.asyncio
+async def test_resume_runtime_session_warns_on_partial_improvement_recovery_inputs(
+    tmp_path: Path,
+) -> None:
+    transcript_store = JsonlTranscriptStore(tmp_path / "transcripts")
+    await _write_replay_transcript(transcript_store)
+    sink = RecordingKernelEventSink()
+    deps = QueryDeps(
+        task_store=AppStateStore(),
+        transcript_store=transcript_store,
+        model_provider=FakeModelProvider(
+            responses=({"role": "assistant", "content": "after resume"},)
+        ),
+        observability=KernelEventBus((sink,)),
+    )
+
+    result = await resume_runtime_session(
+        RuntimeRecoveryRequest(
+            config=QueryConfig(model="model-1", session_id="session-1"),
+            deps=deps,
+            ctx=_ctx(),
+            restore_remote_agents_enabled=False,
+            improvement_record_query=ImprovementRuntimeRecordQuery(session_id="session-1"),
+        )
+    )
+
+    assert result.improvement_chain_recovery is None
+    assert RuntimeRecoveryWarning(
+        source="improvement_runtime",
+        reason=(
+            "improvement_record_store and improvement_record_query are both required "
+            "for improvement runtime recovery"
+        ),
+    ) in result.warnings
+    completed_event = next(
+        event for event in sink.events if event.type == "runtime_recovery.completed"
+    )
+    assert completed_event.data["improvement_chain_recovery_present"] is False
+    assert completed_event.data["improvement_chain_status"] is None
+
+
+@pytest.mark.asyncio
+async def test_resume_runtime_session_attaches_improvement_chain_recovery(
+    tmp_path: Path,
+) -> None:
+    transcript_store = JsonlTranscriptStore(tmp_path / "transcripts")
+    await _write_replay_transcript(transcript_store)
+    sink = RecordingKernelEventSink()
+    store = _ImprovementRecordStore(
+        (
+            ImprovementRuntimeRecord(
+                record_id="irtr_1",
+                record_kind="evidence_collected",
+                session_id="session-1",
+                runtime_session_id="runtime-1",
+                run_id="ir_1",
+                sequence=1,
+                payload={"private": "do-not-emit"},
+                created_at=10.0,
+            ),
+        )
+    )
+    deps = QueryDeps(
+        task_store=AppStateStore(),
+        transcript_store=transcript_store,
+        model_provider=FakeModelProvider(
+            responses=({"role": "assistant", "content": "after resume"},)
+        ),
+        observability=KernelEventBus((sink,)),
+    )
+
+    result = await resume_runtime_session(
+        RuntimeRecoveryRequest(
+            config=QueryConfig(model="model-1", session_id="session-1"),
+            deps=deps,
+            ctx=_ctx(),
+            restore_remote_agents_enabled=False,
+            improvement_record_store=store,
+            improvement_record_query=ImprovementRuntimeRecordQuery(run_id="ir_1"),
+        )
+    )
+
+    assert result.improvement_chain_recovery is not None
+    recovery = result.improvement_chain_recovery
+    assert recovery.status == "recovered"
+    assert recovery.expected_session_id == "session-1"
+    assert recovery.last_record_id == "irtr_1"
+    assert recovery.last_completed_record_id == "irtr_1"
+    assert store.append_calls == []
+
+    completed_event = next(
+        event for event in sink.events if event.type == "runtime_recovery.completed"
+    )
+    assert completed_event.data["improvement_chain_recovery_present"] is True
+    assert completed_event.data["improvement_chain_status"] == "recovered"
+    assert completed_event.data["improvement_chain_record_count"] == 1
+    assert completed_event.data["improvement_chain_warning_count"] == 0
+    assert completed_event.data["improvement_chain_next_record_kind_present"] is False
+    assert completed_event.data["improvement_chain_permission_summary_present"] is False
+    assert "do-not-emit" not in str(completed_event.data)
+
+
+@pytest.mark.asyncio
+async def test_resume_runtime_session_blocks_cross_session_improvement_recovery(
+    tmp_path: Path,
+) -> None:
+    transcript_store = JsonlTranscriptStore(tmp_path / "transcripts")
+    await _write_replay_transcript(transcript_store)
+    store = _ImprovementRecordStore(
+        (
+            ImprovementRuntimeRecord(
+                record_id="irtr_1",
+                record_kind="evidence_collected",
+                session_id="other-session",
+                runtime_session_id="runtime-1",
+                run_id="ir_1",
+                sequence=1,
+                payload={"stage": "evidence"},
+            ),
+        )
+    )
+    deps = QueryDeps(
+        task_store=AppStateStore(),
+        transcript_store=transcript_store,
+        model_provider=FakeModelProvider(
+            responses=({"role": "assistant", "content": "after resume"},)
+        ),
+    )
+
+    result = await resume_runtime_session(
+        RuntimeRecoveryRequest(
+            config=QueryConfig(model="model-1", session_id="session-1"),
+            deps=deps,
+            ctx=_ctx(),
+            restore_remote_agents_enabled=False,
+            improvement_record_store=store,
+            improvement_record_query=ImprovementRuntimeRecordQuery(run_id="ir_1"),
+        )
+    )
+
+    assert result.improvement_chain_recovery is not None
+    assert result.improvement_chain_recovery.status == "blocked"
+    assert result.improvement_chain_recovery.records == ()
+    assert result.improvement_chain_recovery.session_id == "session-1"
+    assert RuntimeRecoveryWarning(
+        source="improvement_runtime",
+        reason="improvement runtime recovery blocked",
+    ) in result.warnings
 
 
 @pytest.mark.asyncio

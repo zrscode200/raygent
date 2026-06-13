@@ -70,6 +70,7 @@ ImprovementRuntimeRecordKind = Literal[
     "runtime_not_enabled",
 ]
 ImprovementRuntimeTransitionStatus = Literal["completed", "blocked", "not_enabled"]
+ImprovementRuntimeRecoveryStatus = Literal["not_found", "recovered", "blocked"]
 ImprovementTaskOutputReadMode = Literal["tail", "range"]
 ImprovementRuntimePermissionStatus = Literal[
     "not_required",
@@ -96,6 +97,9 @@ _RUNTIME_RECORD_KINDS: frozenset[str] = frozenset(
 )
 _RUNTIME_TRANSITION_STATUSES: frozenset[str] = frozenset(
     {"completed", "blocked", "not_enabled"}
+)
+_RUNTIME_RECOVERY_STATUSES: frozenset[str] = frozenset(
+    {"not_found", "recovered", "blocked"}
 )
 _EVIDENCE_SOURCES: frozenset[str] = frozenset(
     {
@@ -1351,6 +1355,279 @@ class ImprovementRecordStore(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class ImprovementRuntimeRecoveryRequest:
+    """Read-only request to recover a stopped explicit improvement chain."""
+
+    request_id: str
+    record_store: ImprovementRecordStore
+    query: ImprovementRuntimeRecordQuery
+    expected_session_id: str | None = None
+    metadata: Mapping[str, FrozenJson] = field(default_factory=_empty_metadata)
+
+    def __post_init__(self) -> None:
+        _require_non_empty(
+            self.request_id,
+            "ImprovementRuntimeRecoveryRequest.request_id",
+        )
+        if self.expected_session_id is not None:
+            _require_non_empty(
+                self.expected_session_id,
+                "ImprovementRuntimeRecoveryRequest.expected_session_id",
+            )
+        _reject_unsafe_runtime_permission_metadata(
+            self.metadata,
+            "ImprovementRuntimeRecoveryRequest.metadata",
+            allow_permission_summary=False,
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_metadata(
+                self.metadata,
+                "ImprovementRuntimeRecoveryRequest.metadata",
+                DEFAULT_MAX_IMPROVEMENT_RUNTIME_METADATA_CHARS,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ImprovementRuntimeRecoveryResult:
+    """Bounded read-only recovery state for one explicit improvement chain."""
+
+    request_id: str
+    status: ImprovementRuntimeRecoveryStatus
+    query: ImprovementRuntimeRecordQuery
+    session_id: str | None = None
+    expected_session_id: str | None = None
+    runtime_session_id: str | None = None
+    run_id: str | None = None
+    proposal_id: str | None = None
+    candidate_id: str | None = None
+    summary: ImprovementRuntimeChainSummary | None = None
+    records: tuple[ImprovementRuntimeRecord, ...] = ()
+    last_record_id: str | None = None
+    last_sequence: int | None = None
+    last_record_kind: ImprovementRuntimeRecordKind | None = None
+    last_completed_record_id: str | None = None
+    last_completed_sequence: int | None = None
+    last_completed_record_kind: ImprovementRuntimeRecordKind | None = None
+    next_record_kind: ImprovementRuntimeRecordKind | None = None
+    permission_summary: ImprovementRuntimePermissionSummary | None = None
+    warnings: tuple[str, ...] = ()
+    metadata: Mapping[str, FrozenJson] = field(default_factory=_empty_metadata)
+
+    def __post_init__(self) -> None:
+        _require_non_empty(
+            self.request_id,
+            "ImprovementRuntimeRecoveryResult.request_id",
+        )
+        _require_literal(
+            self.status,
+            _RUNTIME_RECOVERY_STATUSES,
+            "ImprovementRuntimeRecoveryResult.status",
+        )
+        for field_name, value in (
+            ("session_id", self.session_id),
+            ("expected_session_id", self.expected_session_id),
+            ("runtime_session_id", self.runtime_session_id),
+            ("run_id", self.run_id),
+            ("proposal_id", self.proposal_id),
+            ("candidate_id", self.candidate_id),
+            ("last_record_id", self.last_record_id),
+            ("last_completed_record_id", self.last_completed_record_id),
+        ):
+            if value is not None:
+                _require_non_empty(
+                    value,
+                    f"ImprovementRuntimeRecoveryResult.{field_name}",
+                )
+        for field_name, value in (
+            ("last_sequence", self.last_sequence),
+            ("last_completed_sequence", self.last_completed_sequence),
+        ):
+            if value is not None:
+                _require_minimum(
+                    value,
+                    1,
+                    f"ImprovementRuntimeRecoveryResult.{field_name}",
+                )
+        for field_name, value in (
+            ("last_record_kind", self.last_record_kind),
+            ("last_completed_record_kind", self.last_completed_record_kind),
+            ("next_record_kind", self.next_record_kind),
+        ):
+            if value is not None:
+                _require_literal(
+                    value,
+                    _RUNTIME_RECORD_KINDS,
+                    f"ImprovementRuntimeRecoveryResult.{field_name}",
+                )
+        object.__setattr__(self, "records", tuple(self.records))
+        object.__setattr__(
+            self,
+            "warnings",
+            _bounded_string_tuple(
+                self.warnings,
+                "ImprovementRuntimeRecoveryResult.warnings",
+                max_count=DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS,
+                max_chars=DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNING_CHARS,
+            ),
+        )
+        _reject_unsafe_runtime_permission_metadata(
+            self.metadata,
+            "ImprovementRuntimeRecoveryResult.metadata",
+            allow_permission_summary=False,
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_metadata(
+                self.metadata,
+                "ImprovementRuntimeRecoveryResult.metadata",
+                DEFAULT_MAX_IMPROVEMENT_RUNTIME_METADATA_CHARS,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ImprovementRuntimeRecoveryService:
+    """Read-only recovery helper for caller-owned improvement record stores."""
+
+    async def recover(
+        self,
+        request: ImprovementRuntimeRecoveryRequest,
+    ) -> ImprovementRuntimeRecoveryResult:
+        """Load and summarize a stopped explicit improvement chain."""
+
+        query_conflict = _expected_session_query_conflict(request)
+        if query_conflict is not None:
+            return _blocked_recovery_result(request, query_conflict)
+
+        try:
+            records = tuple(await request.record_store.load_records(request.query))
+            summary = await request.record_store.summarize_chain(request.query)
+        except Exception as exc:  # pragma: no cover - exact store errors are caller-owned.
+            return _blocked_recovery_result(
+                request,
+                "improvement record store recovery failed",
+                metadata={"error_type": type(exc).__name__},
+            )
+
+        try:
+            _validate_recovery_records(request.query, records)
+            if summary is not None:
+                _validate_recovery_summary(request.query, summary)
+            _validate_recovery_session_linkage(request, records, summary)
+            ordered_records, ordering_warnings = _ordered_recovery_records(records)
+            if not ordered_records and summary is None:
+                return ImprovementRuntimeRecoveryResult(
+                    request_id=request.request_id,
+                    status="not_found",
+                    query=request.query,
+                    session_id=request.expected_session_id or request.query.session_id,
+                    expected_session_id=request.expected_session_id,
+                    warnings=("no improvement runtime records matched the query",),
+                    metadata=request.metadata,
+                )
+            resolved_summary = summary or _summary_from_recovery_records(ordered_records)
+            last_record = ordered_records[-1] if ordered_records else None
+            last_completed = _last_completed_recovery_record(
+                ordered_records,
+                resolved_summary,
+            )
+            session_id = _recovery_session_id(
+                request,
+                ordered_records,
+                resolved_summary,
+            )
+            return ImprovementRuntimeRecoveryResult(
+                request_id=request.request_id,
+                status="recovered",
+                query=request.query,
+                session_id=session_id,
+                expected_session_id=request.expected_session_id,
+                runtime_session_id=_recovery_runtime_session_id(
+                    ordered_records,
+                    resolved_summary,
+                ),
+                run_id=_recovery_selector_value(
+                    "run_id",
+                    request.query.run_id,
+                    ordered_records,
+                    resolved_summary,
+                ),
+                proposal_id=_recovery_selector_value(
+                    "proposal_id",
+                    request.query.proposal_id,
+                    ordered_records,
+                    resolved_summary,
+                ),
+                candidate_id=_recovery_selector_value(
+                    "candidate_id",
+                    request.query.candidate_id,
+                    ordered_records,
+                    resolved_summary,
+                ),
+                summary=resolved_summary,
+                records=ordered_records,
+                last_record_id=(
+                    last_record.record_id
+                    if last_record is not None
+                    else resolved_summary.last_record_id
+                ),
+                last_sequence=(
+                    last_record.sequence
+                    if last_record is not None
+                    else resolved_summary.last_sequence
+                ),
+                last_record_kind=(
+                    last_record.record_kind
+                    if last_record is not None
+                    else resolved_summary.last_record_kind
+                ),
+                last_completed_record_id=(
+                    last_completed.record_id
+                    if isinstance(last_completed, ImprovementRuntimeRecord)
+                    else resolved_summary.last_record_id
+                    if last_completed is resolved_summary
+                    else None
+                ),
+                last_completed_sequence=(
+                    last_completed.sequence
+                    if isinstance(last_completed, ImprovementRuntimeRecord)
+                    else resolved_summary.last_sequence
+                    if last_completed is resolved_summary
+                    else None
+                ),
+                last_completed_record_kind=(
+                    last_completed.record_kind
+                    if isinstance(last_completed, ImprovementRuntimeRecord)
+                    else resolved_summary.last_record_kind
+                    if last_completed is resolved_summary
+                    else None
+                ),
+                next_record_kind=resolved_summary.next_record_kind,
+                permission_summary=_permission_summary_from_recovery_record(last_record),
+                warnings=_combined_recovery_warnings(
+                    ordering_warnings,
+                    ordered_records,
+                    resolved_summary,
+                ),
+                metadata=request.metadata,
+            )
+        except ImprovementRuntimeValidationError as exc:
+            return _blocked_recovery_result(request, str(exc))
+
+
+async def recover_improvement_runtime_chain(
+    request: ImprovementRuntimeRecoveryRequest,
+) -> ImprovementRuntimeRecoveryResult:
+    """Recover a stopped explicit improvement chain from an injected store."""
+
+    return await ImprovementRuntimeRecoveryService().recover(request)
+
+
+@dataclass(frozen=True, slots=True)
 class ImprovementRuntimeBridgeConfig:
     """Explicit opt-in configuration for the improvement runtime bridge."""
 
@@ -2054,6 +2331,89 @@ def improvement_runtime_permission_report_to_summary(
     )
 
 
+def improvement_runtime_recovery_result_to_dict(
+    result: ImprovementRuntimeRecoveryResult,
+) -> dict[str, object]:
+    return {
+        "request_id": result.request_id,
+        "status": result.status,
+        "query": _runtime_record_query_to_dict(result.query),
+        "session_id": result.session_id,
+        "expected_session_id": result.expected_session_id,
+        "runtime_session_id": result.runtime_session_id,
+        "run_id": result.run_id,
+        "proposal_id": result.proposal_id,
+        "candidate_id": result.candidate_id,
+        "summary": None
+        if result.summary is None
+        else improvement_runtime_chain_summary_to_dict(result.summary),
+        "records": [improvement_runtime_record_to_dict(record) for record in result.records],
+        "last_record_id": result.last_record_id,
+        "last_sequence": result.last_sequence,
+        "last_record_kind": result.last_record_kind,
+        "last_completed_record_id": result.last_completed_record_id,
+        "last_completed_sequence": result.last_completed_sequence,
+        "last_completed_record_kind": result.last_completed_record_kind,
+        "next_record_kind": result.next_record_kind,
+        "permission_summary": None
+        if result.permission_summary is None
+        else improvement_runtime_permission_summary_to_dict(result.permission_summary),
+        "warnings": list(result.warnings),
+        "metadata": _metadata_to_dict(result.metadata),
+    }
+
+
+def improvement_runtime_recovery_result_from_dict(
+    data: Mapping[str, object],
+) -> ImprovementRuntimeRecoveryResult:
+    summary_data = data.get("summary")
+    permission_summary_data = data.get("permission_summary")
+    return ImprovementRuntimeRecoveryResult(
+        request_id=str(data["request_id"]),
+        status=cast(
+            ImprovementRuntimeRecoveryStatus,
+            _literal_from_object(data["status"], _RUNTIME_RECOVERY_STATUSES, "status"),
+        ),
+        query=_runtime_record_query_from_dict(
+            cast(Mapping[str, object], data["query"])
+        ),
+        session_id=_optional_str(data.get("session_id")),
+        expected_session_id=_optional_str(data.get("expected_session_id")),
+        runtime_session_id=_optional_str(data.get("runtime_session_id")),
+        run_id=_optional_str(data.get("run_id")),
+        proposal_id=_optional_str(data.get("proposal_id")),
+        candidate_id=_optional_str(data.get("candidate_id")),
+        summary=None
+        if summary_data is None
+        else improvement_runtime_chain_summary_from_dict(
+            cast(Mapping[str, object], summary_data)
+        ),
+        records=tuple(
+            improvement_runtime_record_from_dict(item)
+            for item in _mapping_sequence(data.get("records", ()), "records")
+        ),
+        last_record_id=_optional_str(data.get("last_record_id")),
+        last_sequence=_optional_int(data.get("last_sequence"), "last_sequence"),
+        last_record_kind=_optional_record_kind(data.get("last_record_kind")),
+        last_completed_record_id=_optional_str(data.get("last_completed_record_id")),
+        last_completed_sequence=_optional_int(
+            data.get("last_completed_sequence"),
+            "last_completed_sequence",
+        ),
+        last_completed_record_kind=_optional_record_kind(
+            data.get("last_completed_record_kind")
+        ),
+        next_record_kind=_optional_record_kind(data.get("next_record_kind")),
+        permission_summary=None
+        if permission_summary_data is None
+        else improvement_runtime_permission_summary_from_dict(
+            cast(Mapping[str, object], permission_summary_data)
+        ),
+        warnings=_string_tuple(data.get("warnings", ()), "warnings"),
+        metadata=_metadata_from_object(data.get("metadata", {}), "metadata"),
+    )
+
+
 def improvement_runtime_observability_event_to_dict(
     event: ImprovementRuntimeObservabilityEvent,
 ) -> dict[str, object]:
@@ -2303,6 +2663,244 @@ def _is_redaction_marker(value: object) -> bool:
     return True
 
 
+def _expected_session_query_conflict(
+    request: ImprovementRuntimeRecoveryRequest,
+) -> str | None:
+    if (
+        request.expected_session_id is not None
+        and request.query.session_id is not None
+        and request.query.session_id != request.expected_session_id
+    ):
+        return (
+            "ImprovementRuntimeRecoveryRequest.query.session_id must match "
+            "expected_session_id"
+        )
+    return None
+
+
+def _blocked_recovery_result(
+    request: ImprovementRuntimeRecoveryRequest,
+    reason: str,
+    *,
+    metadata: Mapping[str, FrozenJson] | None = None,
+) -> ImprovementRuntimeRecoveryResult:
+    recovery_metadata: dict[str, object] = _metadata_to_dict(request.metadata)
+    if metadata is not None:
+        recovery_metadata.update(_metadata_to_dict(metadata))
+    return ImprovementRuntimeRecoveryResult(
+        request_id=request.request_id,
+        status="blocked",
+        query=request.query,
+        session_id=request.expected_session_id or request.query.session_id,
+        expected_session_id=request.expected_session_id,
+        warnings=(reason,),
+        metadata=_freeze_metadata(
+            recovery_metadata,
+            "ImprovementRuntimeRecoveryResult.metadata",
+            DEFAULT_MAX_IMPROVEMENT_RUNTIME_METADATA_CHARS,
+        ),
+    )
+
+
+def _validate_recovery_records(
+    query: ImprovementRuntimeRecordQuery,
+    records: Sequence[ImprovementRuntimeRecord],
+) -> None:
+    if len(records) > query.max_records:
+        raise ImprovementRuntimeValidationError(
+            "ImprovementRecordStore.load_records returned more records than "
+            "ImprovementRuntimeRecordQuery.max_records"
+        )
+    for record in records:
+        for field_name, expected in (
+            ("session_id", query.session_id),
+            ("run_id", query.run_id),
+            ("proposal_id", query.proposal_id),
+            ("candidate_id", query.candidate_id),
+        ):
+            if expected is not None and getattr(record, field_name) != expected:
+                raise ImprovementRuntimeValidationError(
+                    "ImprovementRecordStore.load_records returned a record "
+                    f"outside query selector {field_name}"
+                )
+
+
+def _validate_recovery_summary(
+    query: ImprovementRuntimeRecordQuery,
+    summary: ImprovementRuntimeChainSummary,
+) -> None:
+    for field_name, expected in (
+        ("session_id", query.session_id),
+        ("run_id", query.run_id),
+        ("proposal_id", query.proposal_id),
+        ("candidate_id", query.candidate_id),
+    ):
+        if expected is not None and getattr(summary, field_name) != expected:
+            raise ImprovementRuntimeValidationError(
+                "ImprovementRecordStore.summarize_chain returned a summary "
+                f"outside query selector {field_name}"
+            )
+
+
+def _validate_recovery_session_linkage(
+    request: ImprovementRuntimeRecoveryRequest,
+    records: Sequence[ImprovementRuntimeRecord],
+    summary: ImprovementRuntimeChainSummary | None,
+) -> None:
+    expected = request.expected_session_id
+    session_ids = {record.session_id for record in records}
+    if summary is not None:
+        session_ids.add(summary.session_id)
+    if expected is not None and any(session_id != expected for session_id in session_ids):
+        raise ImprovementRuntimeValidationError(
+            "improvement runtime recovery session_id must match expected_session_id"
+        )
+    if len(session_ids) > 1:
+        raise ImprovementRuntimeValidationError(
+            "improvement runtime recovery records must belong to one session_id"
+        )
+
+
+def _ordered_recovery_records(
+    records: Sequence[ImprovementRuntimeRecord],
+) -> tuple[tuple[ImprovementRuntimeRecord, ...], tuple[str, ...]]:
+    ordered = tuple(
+        sorted(records, key=lambda item: (item.sequence, item.created_at, item.record_id))
+    )
+    duplicate_sequences = sorted(
+        sequence
+        for sequence in {record.sequence for record in ordered}
+        if sum(1 for record in ordered if record.sequence == sequence) > 1
+    )
+    warnings = tuple(
+        f"duplicate improvement runtime record sequence: {sequence}"
+        for sequence in duplicate_sequences
+    )
+    return ordered, warnings
+
+
+def _summary_from_recovery_records(
+    ordered_records: Sequence[ImprovementRuntimeRecord],
+) -> ImprovementRuntimeChainSummary:
+    if not ordered_records:
+        raise ImprovementRuntimeValidationError(
+            "cannot derive recovery summary without records"
+        )
+    last = ordered_records[-1]
+    status = _transition_status_from_record_kind(last.record_kind)
+    return ImprovementRuntimeChainSummary(
+        session_id=last.session_id,
+        runtime_session_id=last.runtime_session_id,
+        run_id=last.run_id,
+        proposal_id=last.proposal_id,
+        candidate_id=last.candidate_id,
+        record_count=len(ordered_records),
+        status=status,
+        last_record_id=last.record_id,
+        last_sequence=last.sequence,
+        last_record_kind=last.record_kind,
+        blocked_reason=last.stop_reason if status != "completed" else None,
+        metadata={"summary_source": "loaded_records"},
+    )
+
+
+def _transition_status_from_record_kind(
+    record_kind: ImprovementRuntimeRecordKind,
+) -> ImprovementRuntimeTransitionStatus:
+    if record_kind == "runtime_blocked":
+        return "blocked"
+    if record_kind == "runtime_not_enabled":
+        return "not_enabled"
+    return "completed"
+
+
+def _last_completed_recovery_record(
+    ordered_records: Sequence[ImprovementRuntimeRecord],
+    summary: ImprovementRuntimeChainSummary,
+) -> ImprovementRuntimeRecord | ImprovementRuntimeChainSummary | None:
+    for record in reversed(ordered_records):
+        if _transition_status_from_record_kind(record.record_kind) == "completed":
+            return record
+    if (
+        not ordered_records
+        and summary.last_record_kind is not None
+        and _transition_status_from_record_kind(summary.last_record_kind) == "completed"
+    ):
+        return summary
+    return None
+
+
+def _recovery_session_id(
+    request: ImprovementRuntimeRecoveryRequest,
+    ordered_records: Sequence[ImprovementRuntimeRecord],
+    summary: ImprovementRuntimeChainSummary,
+) -> str | None:
+    if request.expected_session_id is not None:
+        return request.expected_session_id
+    if request.query.session_id is not None:
+        return request.query.session_id
+    if ordered_records:
+        return ordered_records[0].session_id
+    return summary.session_id
+
+
+def _recovery_runtime_session_id(
+    ordered_records: Sequence[ImprovementRuntimeRecord],
+    summary: ImprovementRuntimeChainSummary,
+) -> str | None:
+    for record in reversed(ordered_records):
+        if record.runtime_session_id is not None:
+            return record.runtime_session_id
+    return summary.runtime_session_id
+
+
+def _recovery_selector_value(
+    field_name: str,
+    query_value: str | None,
+    ordered_records: Sequence[ImprovementRuntimeRecord],
+    summary: ImprovementRuntimeChainSummary,
+) -> str | None:
+    if query_value is not None:
+        return query_value
+    for record in reversed(ordered_records):
+        value = getattr(record, field_name)
+        if value is not None:
+            return cast(str, value)
+    return cast(str | None, getattr(summary, field_name))
+
+
+def _permission_summary_from_recovery_record(
+    record: ImprovementRuntimeRecord | None,
+) -> ImprovementRuntimePermissionSummary | None:
+    if record is None:
+        return None
+    value = record.metadata.get("permission_summary")
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ImprovementRuntimeValidationError(
+            "ImprovementRuntimeRecord.metadata.permission_summary must be a mapping"
+        )
+    return improvement_runtime_permission_summary_from_dict(cast(Mapping[str, object], value))
+
+
+def _combined_recovery_warnings(
+    ordering_warnings: Sequence[str],
+    ordered_records: Sequence[ImprovementRuntimeRecord],
+    summary: ImprovementRuntimeChainSummary,
+) -> tuple[str, ...]:
+    warnings: list[str] = list(ordering_warnings)
+    warnings.extend(summary.warnings)
+    for record in ordered_records:
+        warnings.extend(record.warnings)
+    return _bounded_string_tuple(
+        warnings,
+        "ImprovementRuntimeRecoveryResult.warnings",
+        max_count=DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS,
+        max_chars=DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNING_CHARS,
+    )
+
+
 def _runtime_result(
     request: ImprovementRuntimeRequest,
     *,
@@ -2381,6 +2979,33 @@ def _validate_store_append_result(
         raise ImprovementRuntimeValidationError(
             "ImprovementRecordStore.append_record returned a different runtime record"
         )
+
+
+def _runtime_record_query_to_dict(
+    query: ImprovementRuntimeRecordQuery,
+) -> dict[str, object]:
+    return {
+        "session_id": query.session_id,
+        "run_id": query.run_id,
+        "proposal_id": query.proposal_id,
+        "candidate_id": query.candidate_id,
+        "max_records": query.max_records,
+    }
+
+
+def _runtime_record_query_from_dict(
+    data: Mapping[str, object],
+) -> ImprovementRuntimeRecordQuery:
+    return ImprovementRuntimeRecordQuery(
+        session_id=_optional_str(data.get("session_id")),
+        run_id=_optional_str(data.get("run_id")),
+        proposal_id=_optional_str(data.get("proposal_id")),
+        candidate_id=_optional_str(data.get("candidate_id")),
+        max_records=_int_from_object(
+            data.get("max_records", DEFAULT_MAX_IMPROVEMENT_RUNTIME_SUMMARY_RECORDS),
+            "max_records",
+        ),
+    )
 
 
 def _require_schema_version(schema_version: int) -> None:
@@ -2729,6 +3354,10 @@ __all__ = (
     "ImprovementRuntimeRecord",
     "ImprovementRuntimeRecordKind",
     "ImprovementRuntimeRecordQuery",
+    "ImprovementRuntimeRecoveryRequest",
+    "ImprovementRuntimeRecoveryResult",
+    "ImprovementRuntimeRecoveryService",
+    "ImprovementRuntimeRecoveryStatus",
     "ImprovementRuntimeRequest",
     "ImprovementRuntimeTransitionResult",
     "ImprovementRuntimeTransitionStatus",
@@ -2755,5 +3384,8 @@ __all__ = (
     "improvement_runtime_permission_summary_to_dict",
     "improvement_runtime_record_from_dict",
     "improvement_runtime_record_to_dict",
+    "improvement_runtime_recovery_result_from_dict",
+    "improvement_runtime_recovery_result_to_dict",
+    "recover_improvement_runtime_chain",
     "validate_improvement_evidence_collection",
 )

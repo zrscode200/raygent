@@ -29,6 +29,7 @@ from raygent_harness.services.improvement_runtime import (
     DEFAULT_MAX_EVIDENCE_COLLECTION_WARNINGS,
     DEFAULT_MAX_IMPROVEMENT_RUNTIME_METADATA_CHARS,
     DEFAULT_MAX_IMPROVEMENT_RUNTIME_SUMMARY_RECORDS,
+    DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS,
     IMPROVEMENT_RUNTIME_RECORD_SCHEMA_VERSION,
     ImprovementEvidenceCollectionBounds,
     ImprovementEvidenceCollectionRequest,
@@ -44,6 +45,8 @@ from raygent_harness.services.improvement_runtime import (
     ImprovementRuntimePermissionRequirement,
     ImprovementRuntimeRecord,
     ImprovementRuntimeRecordQuery,
+    ImprovementRuntimeRecoveryRequest,
+    ImprovementRuntimeRecoveryService,
     ImprovementRuntimeRequest,
     ImprovementRuntimeTransitionResult,
     ImprovementRuntimeValidationError,
@@ -63,6 +66,9 @@ from raygent_harness.services.improvement_runtime import (
     improvement_runtime_permission_summary_to_dict,
     improvement_runtime_record_from_dict,
     improvement_runtime_record_to_dict,
+    improvement_runtime_recovery_result_from_dict,
+    improvement_runtime_recovery_result_to_dict,
+    recover_improvement_runtime_chain,
     validate_improvement_evidence_collection,
 )
 from raygent_harness.services.task_output import (
@@ -125,6 +131,10 @@ def _empty_runtime_records() -> list[ImprovementRuntimeRecord]:
     return []
 
 
+def _empty_record_queries() -> list[ImprovementRuntimeRecordQuery]:
+    return []
+
+
 @dataclass
 class FakeEvidenceSource:
     evidence: tuple[ImprovementEvidence, ...] = field(
@@ -157,11 +167,18 @@ class FakeRecordStore:
     records: list[ImprovementRuntimeRecord] = field(
         default_factory=_empty_runtime_records
     )
+    load_requests: list[ImprovementRuntimeRecordQuery] = field(
+        default_factory=_empty_record_queries
+    )
+    append_requests: list[ImprovementRuntimeRecord] = field(
+        default_factory=_empty_runtime_records
+    )
 
     async def append_record(
         self,
         record: ImprovementRuntimeRecord,
     ) -> ImprovementRuntimeRecord:
+        self.append_requests.append(record)
         self.records.append(record)
         return record
 
@@ -169,8 +186,11 @@ class FakeRecordStore:
         self,
         query: ImprovementRuntimeRecordQuery,
     ) -> tuple[ImprovementRuntimeRecord, ...]:
+        self.load_requests.append(query)
         return tuple(
-            record for record in self.records if record.session_id == query.session_id
+            record
+            for record in self.records
+            if _record_matches_query(record, query)
         )
 
     async def summarize_chain(
@@ -192,6 +212,21 @@ class FakeRecordStore:
         )
 
 
+def _record_matches_query(
+    record: ImprovementRuntimeRecord,
+    query: ImprovementRuntimeRecordQuery,
+) -> bool:
+    for field_name, expected in (
+        ("session_id", query.session_id),
+        ("run_id", query.run_id),
+        ("proposal_id", query.proposal_id),
+        ("candidate_id", query.candidate_id),
+    ):
+        if expected is not None and getattr(record, field_name) != expected:
+            return False
+    return True
+
+
 @dataclass
 class ReplacingRecordStore(FakeRecordStore):
     async def append_record(
@@ -200,6 +235,34 @@ class ReplacingRecordStore(FakeRecordStore):
     ) -> ImprovementRuntimeRecord:
         self.records.append(record)
         return replace(record, session_id="other-session")
+
+
+class NoSummaryRecordStore(FakeRecordStore):
+    async def summarize_chain(
+        self,
+        query: ImprovementRuntimeRecordQuery,
+    ) -> ImprovementRuntimeChainSummary | None:
+        _ = query
+        return None
+
+
+@dataclass
+class SummaryOnlyRecordStore(FakeRecordStore):
+    summary: ImprovementRuntimeChainSummary | None = None
+
+    async def load_records(
+        self,
+        query: ImprovementRuntimeRecordQuery,
+    ) -> tuple[ImprovementRuntimeRecord, ...]:
+        self.load_requests.append(query)
+        return ()
+
+    async def summarize_chain(
+        self,
+        query: ImprovementRuntimeRecordQuery,
+    ) -> ImprovementRuntimeChainSummary | None:
+        _ = query
+        return self.summary
 
 
 def _empty_observability_events() -> list[ImprovementRuntimeObservabilityEvent]:
@@ -893,6 +956,239 @@ def test_runtime_chain_summary_round_trips() -> None:
     json.dumps(snapshot)
 
     assert improvement_runtime_chain_summary_from_dict(snapshot) == summary
+
+
+@pytest.mark.asyncio
+async def test_recover_runtime_chain_orders_records_and_reports_last_completed() -> None:
+    permission_report = ImprovementRuntimePermissionPolicy().evaluate(
+        request_id="irt_1",
+        session_id="session-1",
+        runtime_session_id="runtime-1",
+        stage_id="verification",
+        requirements=(
+            ImprovementRuntimePermissionRequirement(
+                stage_id="verification",
+                record_kind="verification_recorded",
+                required_permissions=("filesystem_mutation", "shell"),
+            ),
+        ),
+        approved_permissions=("filesystem_mutation",),
+    )
+    permission_summary_metadata = cast(
+        Mapping[str, FrozenJson],
+        {
+            "permission_summary": improvement_runtime_permission_summary_to_dict(
+                permission_report.to_summary()
+            )
+        },
+    )
+    store = NoSummaryRecordStore(
+        records=[
+            ImprovementRuntimeRecord(
+                record_id="irtr_2",
+                record_kind="verification_recorded",
+                session_id="session-1",
+                runtime_session_id="runtime-1",
+                run_id="ir_1",
+                sequence=2,
+                payload={"stage": "verification"},
+                created_at=20.0,
+            ),
+            ImprovementRuntimeRecord(
+                record_id="irtr_1",
+                record_kind="evidence_collected",
+                session_id="session-1",
+                runtime_session_id="runtime-1",
+                run_id="ir_1",
+                sequence=1,
+                payload={"stage": "evidence"},
+                warnings=("evidence truncated",),
+                created_at=10.0,
+            ),
+            ImprovementRuntimeRecord(
+                record_id="irtr_3",
+                record_kind="runtime_blocked",
+                session_id="session-1",
+                runtime_session_id="runtime-1",
+                run_id="ir_1",
+                sequence=3,
+                payload={"stage": "promotion"},
+                stop_reason="verification approval is incomplete",
+                metadata=permission_summary_metadata,
+                created_at=30.0,
+            ),
+        ]
+    )
+
+    result = await recover_improvement_runtime_chain(
+        ImprovementRuntimeRecoveryRequest(
+            request_id="irr_1",
+            record_store=store,
+            query=ImprovementRuntimeRecordQuery(run_id="ir_1"),
+            expected_session_id="session-1",
+        )
+    )
+
+    assert result.status == "recovered"
+    assert [record.record_id for record in result.records] == [
+        "irtr_1",
+        "irtr_2",
+        "irtr_3",
+    ]
+    assert result.last_record_id == "irtr_3"
+    assert result.last_record_kind == "runtime_blocked"
+    assert result.last_completed_record_id == "irtr_2"
+    assert result.last_completed_record_kind == "verification_recorded"
+    assert result.summary is not None
+    assert result.summary.status == "blocked"
+    assert result.permission_summary is not None
+    assert result.permission_summary.status == "blocked"
+    assert store.append_requests == []
+    assert "evidence truncated" in result.warnings
+
+    snapshot = improvement_runtime_recovery_result_to_dict(result)
+    json.dumps(snapshot)
+
+    assert improvement_runtime_recovery_result_from_dict(snapshot) == result
+
+
+@pytest.mark.asyncio
+async def test_recover_runtime_chain_fallback_summary_does_not_duplicate_record_warnings() -> None:
+    store = NoSummaryRecordStore(
+        records=[
+            ImprovementRuntimeRecord(
+                record_id="irtr_1",
+                record_kind="evidence_collected",
+                session_id="session-1",
+                run_id="ir_1",
+                sequence=1,
+                payload={"stage": "evidence"},
+                warnings=tuple(
+                    f"warning-{index}"
+                    for index in range(DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS)
+                ),
+            )
+        ]
+    )
+
+    result = await recover_improvement_runtime_chain(
+        ImprovementRuntimeRecoveryRequest(
+            request_id="irr_1",
+            record_store=store,
+            query=ImprovementRuntimeRecordQuery(run_id="ir_1"),
+            expected_session_id="session-1",
+        )
+    )
+
+    assert result.status == "recovered"
+    assert result.summary is not None
+    assert result.summary.warnings == ()
+    assert len(result.warnings) == DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS
+    assert result.warnings == store.records[0].warnings
+
+
+@pytest.mark.asyncio
+async def test_recover_runtime_chain_blocks_expected_session_mismatch_before_store() -> None:
+    store = FakeRecordStore()
+
+    result = await ImprovementRuntimeRecoveryService().recover(
+        ImprovementRuntimeRecoveryRequest(
+            request_id="irr_1",
+            record_store=store,
+            query=ImprovementRuntimeRecordQuery(session_id="other-session"),
+            expected_session_id="session-1",
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.records == ()
+    assert result.session_id == "session-1"
+    assert store.load_requests == []
+    assert "expected_session_id" in result.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_recover_runtime_chain_reports_not_found_without_records_or_summary() -> None:
+    store = FakeRecordStore()
+
+    result = await recover_improvement_runtime_chain(
+        ImprovementRuntimeRecoveryRequest(
+            request_id="irr_1",
+            record_store=store,
+            query=ImprovementRuntimeRecordQuery(run_id="missing-run"),
+            expected_session_id="session-1",
+        )
+    )
+
+    assert result.status == "not_found"
+    assert result.records == ()
+    assert result.summary is None
+    assert result.session_id == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_recover_runtime_chain_last_completed_handles_blocked_only_and_summary() -> None:
+    blocked_store = NoSummaryRecordStore(
+        records=[
+            ImprovementRuntimeRecord(
+                record_id="irtr_2",
+                record_kind="runtime_not_enabled",
+                session_id="session-1",
+                run_id="ir_1",
+                sequence=2,
+                payload={"stage": "disabled"},
+                created_at=20.0,
+            ),
+            ImprovementRuntimeRecord(
+                record_id="irtr_1",
+                record_kind="runtime_blocked",
+                session_id="session-1",
+                run_id="ir_1",
+                sequence=2,
+                payload={"stage": "blocked"},
+                created_at=10.0,
+            ),
+        ]
+    )
+    blocked_result = await recover_improvement_runtime_chain(
+        ImprovementRuntimeRecoveryRequest(
+            request_id="irr_blocked",
+            record_store=blocked_store,
+            query=ImprovementRuntimeRecordQuery(run_id="ir_1"),
+            expected_session_id="session-1",
+        )
+    )
+
+    assert blocked_result.status == "recovered"
+    assert blocked_result.last_completed_record_id is None
+    assert blocked_result.last_completed_record_kind is None
+    assert any("duplicate" in warning for warning in blocked_result.warnings)
+
+    summary_store = SummaryOnlyRecordStore(
+        summary=ImprovementRuntimeChainSummary(
+            session_id="session-1",
+            run_id="ir_2",
+            record_count=2,
+            status="completed",
+            last_record_id="irtr_summary",
+            last_sequence=2,
+            last_record_kind="gate_evaluated",
+        )
+    )
+    summary_result = await recover_improvement_runtime_chain(
+        ImprovementRuntimeRecoveryRequest(
+            request_id="irr_summary",
+            record_store=summary_store,
+            query=ImprovementRuntimeRecordQuery(run_id="ir_2"),
+            expected_session_id="session-1",
+        )
+    )
+
+    assert summary_result.status == "recovered"
+    assert summary_result.records == ()
+    assert summary_result.last_record_id == "irtr_summary"
+    assert summary_result.last_completed_record_id == "irtr_summary"
+    assert summary_result.last_completed_record_kind == "gate_evaluated"
 
 
 def test_permission_requirement_and_policy_report_advisory_statuses() -> None:

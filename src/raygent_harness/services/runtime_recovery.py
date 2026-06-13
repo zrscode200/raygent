@@ -24,6 +24,13 @@ from raygent_harness.services.agent_routes import (
     AgentRouteRecordStore,
     normalize_agent_route_record_for_resume,
 )
+from raygent_harness.services.improvement_runtime import (
+    ImprovementRecordStore,
+    ImprovementRuntimeRecordQuery,
+    ImprovementRuntimeRecoveryRequest,
+    ImprovementRuntimeRecoveryResult,
+    recover_improvement_runtime_chain,
+)
 from raygent_harness.services.task_notification_replay import (
     TaskNotificationReplayRecord,
     TaskNotificationReplayResult,
@@ -52,6 +59,7 @@ RuntimeRecoveryWarningSource = Literal[
     "task_notification",
     "worktree",
     "task_output",
+    "improvement_runtime",
 ]
 
 
@@ -92,6 +100,8 @@ class RuntimeRecoveryRequest:
     coordinator_snapshot_store: CoordinatorRuntimeSnapshotStore | None = None
     agent_route_record_store: AgentRouteRecordStore | None = None
     task_output_store: TaskOutputStore | None = None
+    improvement_record_store: ImprovementRecordStore | None = None
+    improvement_record_query: ImprovementRuntimeRecordQuery | None = None
     remote_poll_interval_s: float = 0.05
     restore_remote_agents_enabled: bool = True
     offline_task_notifications: Sequence[TaskNotificationReplayRecord] = ()
@@ -112,6 +122,7 @@ class RuntimeRecoveryResult:
     task_notification_replay: TaskNotificationReplayResult = field(
         default_factory=TaskNotificationReplayResult
     )
+    improvement_chain_recovery: ImprovementRuntimeRecoveryResult | None = None
     warnings: tuple[RuntimeRecoveryWarning, ...] = ()
     transcript_store: TranscriptStore | None = None
 
@@ -215,6 +226,11 @@ class RuntimeRecoveryService:
             offline_task_notification_count,
         )
         task_output_statuses = await _check_task_outputs(request, restored_routes, warnings)
+        improvement_chain_recovery = await _recover_improvement_runtime_chain(
+            request,
+            transcript_scope,
+            warnings,
+        )
         replay_result = _combine_task_notification_replay_results(replay_results)
 
         deps.observability.emit(
@@ -233,6 +249,24 @@ class RuntimeRecoveryService:
                 "restored_remote_task_count": len(restored_remote_ids),
                 "worktree_status_count": len(worktree_statuses),
                 "task_output_status_count": len(task_output_statuses),
+                "improvement_chain_recovery_present": (
+                    improvement_chain_recovery is not None
+                ),
+                "improvement_chain_status": None
+                if improvement_chain_recovery is None
+                else improvement_chain_recovery.status,
+                "improvement_chain_record_count": 0
+                if improvement_chain_recovery is None
+                else len(improvement_chain_recovery.records),
+                "improvement_chain_warning_count": 0
+                if improvement_chain_recovery is None
+                else len(improvement_chain_recovery.warnings),
+                "improvement_chain_next_record_kind_present": False
+                if improvement_chain_recovery is None
+                else improvement_chain_recovery.next_record_kind is not None,
+                "improvement_chain_permission_summary_present": False
+                if improvement_chain_recovery is None
+                else improvement_chain_recovery.permission_summary is not None,
                 "offline_task_notification_count": offline_task_notification_count[0],
                 "replayed_task_notification_count": replay_result.enqueued_count,
                 "skipped_replay_duplicate_count": (
@@ -262,9 +296,50 @@ class RuntimeRecoveryService:
             worktree_statuses=worktree_statuses,
             task_output_statuses=task_output_statuses,
             task_notification_replay=replay_result,
+            improvement_chain_recovery=improvement_chain_recovery,
             warnings=tuple(warnings),
             transcript_store=transcript_store,
         )
+
+
+async def _recover_improvement_runtime_chain(
+    request: RuntimeRecoveryRequest,
+    transcript_scope: TranscriptScope,
+    warnings: list[RuntimeRecoveryWarning],
+) -> ImprovementRuntimeRecoveryResult | None:
+    store = request.improvement_record_store
+    query = request.improvement_record_query
+    if store is None and query is None:
+        return None
+    if store is None or query is None:
+        warnings.append(
+            RuntimeRecoveryWarning(
+                source="improvement_runtime",
+                reason=(
+                    "improvement_record_store and improvement_record_query are both "
+                    "required for improvement runtime recovery"
+                ),
+            )
+        )
+        return None
+
+    result = await recover_improvement_runtime_chain(
+        ImprovementRuntimeRecoveryRequest(
+            request_id=f"runtime_recovery:{transcript_scope.session_id}",
+            record_store=store,
+            query=query,
+            expected_session_id=transcript_scope.session_id,
+            metadata={"source": "runtime_recovery"},
+        )
+    )
+    if result.status == "blocked":
+        warnings.append(
+            RuntimeRecoveryWarning(
+                source="improvement_runtime",
+                reason="improvement runtime recovery blocked",
+            )
+        )
+    return result
 
 
 async def _initial_transcript_scope(
