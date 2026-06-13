@@ -934,6 +934,52 @@ def test_runtime_record_and_summary_validate_schema_and_bounds() -> None:
         )
 
 
+def test_runtime_chain_summary_rejects_unsafe_permission_metadata() -> None:
+    full_report = ImprovementRuntimePermissionPolicy().evaluate(
+        request_id="irt_1",
+        session_id="session-1",
+        stage_id="verification",
+        requirements=(
+            ImprovementRuntimePermissionRequirement(
+                stage_id="verification",
+                required_permissions=("filesystem_mutation",),
+            ),
+        ),
+        approved_permissions=("filesystem_mutation",),
+    )
+
+    unsafe_summary_metadata = cast(
+        Mapping[str, FrozenJson],
+        {"permission_report": improvement_runtime_permission_report_to_dict(full_report)},
+    )
+    safe_summary_metadata = cast(
+        Mapping[str, FrozenJson],
+        {
+            "permission_summary": improvement_runtime_permission_summary_to_dict(
+                full_report.to_summary()
+            )
+        },
+    )
+
+    with pytest.raises(ImprovementRuntimeValidationError, match="permission_report"):
+        ImprovementRuntimeChainSummary(
+            session_id="session-1",
+            record_count=1,
+            status="blocked",
+            metadata=unsafe_summary_metadata,
+        )
+
+    summary = ImprovementRuntimeChainSummary(
+        session_id="session-1",
+        record_count=1,
+        status="blocked",
+        metadata=safe_summary_metadata,
+    )
+    recovered_summary = cast(Mapping[str, object], summary.metadata["permission_summary"])
+
+    assert recovered_summary["status"] == full_report.to_summary().status
+
+
 def test_runtime_chain_summary_round_trips() -> None:
     summary = ImprovementRuntimeChainSummary(
         session_id="session-1",
@@ -1471,6 +1517,27 @@ async def test_bridge_blocks_when_enabled_without_evidence_sources() -> None:
     assert result.status == "blocked"
     assert result.blocked_reason == "no improvement evidence source adapters were supplied"
     assert result.records[0].record_kind == "runtime_blocked"
+
+
+@pytest.mark.asyncio
+async def test_bridge_persists_enabled_blocked_transition_to_configured_store() -> None:
+    store = FakeRecordStore()
+
+    result = await ImprovementRuntimeBridge(
+        ImprovementRuntimeBridgeConfig(enabled=True, record_store=store),
+        record_id_factory=lambda: "irtr_blocked",
+    ).collect_evidence(
+        ImprovementRuntimeRequest(
+            request_id="irt_1",
+            session_id="session-1",
+            runtime_session_id="runtime-1",
+            collection_request=_collection_request(),
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.records[0].record_kind == "runtime_blocked"
+    assert store.records == [result.records[0]]
 
 
 @pytest.mark.asyncio

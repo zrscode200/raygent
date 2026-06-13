@@ -927,6 +927,11 @@ class ImprovementRuntimeChainSummary:
                 max_chars=DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNING_CHARS,
             ),
         )
+        _reject_unsafe_runtime_permission_metadata(
+            self.metadata,
+            "ImprovementRuntimeChainSummary.metadata",
+            allow_permission_summary=True,
+        )
         object.__setattr__(
             self,
             "metadata",
@@ -1840,7 +1845,8 @@ class ImprovementRuntimeBridge:
                 )
             )
         if request.collection_request is None:
-            return self._emit_transition_observation(
+            return await self._store_and_emit_transition_observation(
+                request,
                 _runtime_result(
                     request,
                     status="blocked",
@@ -1849,12 +1855,13 @@ class ImprovementRuntimeBridge:
                     sequence=request.record_sequence,
                     created_at=self.clock(),
                     record_id=self._new_record_id(),
-                )
+                ),
             )
 
         evidence_sources = request.evidence_sources or self.config.evidence_sources
         if not evidence_sources:
-            return self._emit_transition_observation(
+            return await self._store_and_emit_transition_observation(
+                request,
                 _runtime_result(
                     request,
                     status="blocked",
@@ -1863,7 +1870,7 @@ class ImprovementRuntimeBridge:
                     sequence=request.record_sequence,
                     created_at=self.clock(),
                     record_id=self._new_record_id(),
-                )
+                ),
             )
 
         evidence: list[ImprovementEvidence] = []
@@ -1949,6 +1956,31 @@ class ImprovementRuntimeBridge:
                 "record_id_factory returned an empty id"
             )
         return record_id
+
+    async def _store_and_emit_transition_observation(
+        self,
+        request: ImprovementRuntimeRequest,
+        result: ImprovementRuntimeTransitionResult,
+    ) -> ImprovementRuntimeTransitionResult:
+        record_store = request.record_store or self.config.record_store
+        if record_store is None or not result.records:
+            return self._emit_transition_observation(result)
+        stored_records: list[ImprovementRuntimeRecord] = []
+        for record in result.records:
+            stored_record = await record_store.append_record(record)
+            _validate_store_append_result(record, stored_record)
+            stored_records.append(stored_record)
+        summary = result.summary
+        if summary is not None:
+            summary = replace(
+                summary,
+                last_record_id=stored_records[-1].record_id,
+                last_sequence=stored_records[-1].sequence,
+                last_record_kind=stored_records[-1].record_kind,
+            )
+        return self._emit_transition_observation(
+            replace(result, records=tuple(stored_records), summary=summary)
+        )
 
     def _emit_transition_observation(
         self,
