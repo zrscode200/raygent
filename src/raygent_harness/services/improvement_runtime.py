@@ -11,6 +11,7 @@ import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from hashlib import sha256
 from types import MappingProxyType
 from typing import Literal, Protocol, cast
 from uuid import uuid4
@@ -23,6 +24,15 @@ from raygent_harness.improvement import (
     improvement_evidence_from_dict,
     improvement_evidence_text_chars,
     improvement_evidence_to_dict,
+)
+from raygent_harness.services.task_output import TaskOutputStore
+from raygent_harness.services.transcript import (
+    TranscriptSearchCompactMode,
+    TranscriptSearchMatch,
+    TranscriptSearchOrder,
+    TranscriptSearchRequest,
+    TranscriptSearchScope,
+    TranscriptSearchService,
 )
 
 IMPROVEMENT_RUNTIME_RECORD_SCHEMA_VERSION = 1
@@ -41,6 +51,7 @@ DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNING_CHARS = 1_000
 DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS = 20
 DEFAULT_MAX_IMPROVEMENT_RUNTIME_STOP_REASON_CHARS = 4_000
 DEFAULT_MAX_IMPROVEMENT_RUNTIME_SUMMARY_RECORDS = 50
+TRANSCRIPT_SEARCH_MIN_SNIPPET_CHARS = 16
 
 ImprovementRuntimeRecordKind = Literal[
     "evidence_collected",
@@ -57,6 +68,7 @@ ImprovementRuntimeRecordKind = Literal[
     "runtime_not_enabled",
 ]
 ImprovementRuntimeTransitionStatus = Literal["completed", "blocked", "not_enabled"]
+ImprovementTaskOutputReadMode = Literal["tail", "range"]
 
 _RUNTIME_RECORD_KINDS: frozenset[str] = frozenset(
     {
@@ -86,6 +98,29 @@ _EVIDENCE_SOURCES: frozenset[str] = frozenset(
         "user_report",
         "cost_usage",
         "other",
+    }
+)
+_TASK_OUTPUT_READ_MODES: frozenset[str] = frozenset({"tail", "range"})
+_RAW_OBSERVABILITY_METADATA_KEYS: frozenset[str] = frozenset(
+    {
+        "prompt",
+        "content",
+        "output",
+        "tool_input",
+        "tool_result",
+        "transcript",
+    }
+)
+_REDACTION_MARKER_KEYS: frozenset[str] = frozenset(
+    {
+        "redacted",
+        "summary",
+        "reason",
+        "kind",
+        "digest",
+        "chars",
+        "bytes",
+        "items",
     }
 )
 
@@ -277,6 +312,370 @@ class ImprovementEvidenceSourceAdapter(Protocol):
     ) -> ImprovementEvidenceCollectionResult:
         """Collect bounded evidence without invoking Raygent tools."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptSearchImprovementEvidenceAdapter:
+    """Convert bounded transcript search matches into improvement evidence."""
+
+    search_service: TranscriptSearchService
+    roles: tuple[str, ...] = ("user", "assistant")
+    compact_mode: TranscriptSearchCompactMode = "active"
+    order: TranscriptSearchOrder = "newest_first"
+    include_main: bool = True
+    sidechain_agent_ids: tuple[str, ...] = ()
+    include_all_sidechains: bool = False
+    source_id: str = "transcript_search"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "roles",
+            _bounded_string_tuple(
+                self.roles,
+                "TranscriptSearchImprovementEvidenceAdapter.roles",
+                max_count=20,
+                max_chars=80,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "sidechain_agent_ids",
+            _bounded_string_tuple(
+                self.sidechain_agent_ids,
+                "TranscriptSearchImprovementEvidenceAdapter.sidechain_agent_ids",
+                max_count=50,
+                max_chars=200,
+            ),
+        )
+        _require_literal(
+            self.compact_mode,
+            frozenset({"active", "full"}),
+            "TranscriptSearchImprovementEvidenceAdapter.compact_mode",
+        )
+        _require_literal(
+            self.order,
+            frozenset({"newest_first", "oldest_first"}),
+            "TranscriptSearchImprovementEvidenceAdapter.order",
+        )
+        _require_non_empty(
+            self.source_id,
+            "TranscriptSearchImprovementEvidenceAdapter.source_id",
+        )
+
+    async def collect(
+        self,
+        request: ImprovementEvidenceCollectionRequest,
+    ) -> ImprovementEvidenceCollectionResult:
+        """Search transcript snippets only when the caller requested transcripts."""
+
+        if not _source_requested(request, "transcript"):
+            return _collection_result(request, source_id=self.source_id)
+        if request.query is None or not request.query.strip():
+            return _collection_result(
+                request,
+                source_id=self.source_id,
+                warnings=("transcript evidence query is required",),
+            )
+
+        search_budget = _transcript_search_budget(request.bounds)
+        if isinstance(search_budget, str):
+            return _collection_result(
+                request,
+                source_id=self.source_id,
+                warnings=(search_budget,),
+            )
+        max_snippet_chars, max_total_snippet_chars = search_budget
+        result = await self.search_service.search(
+            TranscriptSearchRequest(
+                query=request.query,
+                scope=TranscriptSearchScope(
+                    session_id=request.session_id,
+                    runtime_session_id=request.runtime_session_id,
+                    include_main=self.include_main,
+                    sidechain_agent_ids=self.sidechain_agent_ids,
+                    include_all_sidechains=self.include_all_sidechains,
+                ),
+                max_results=request.bounds.max_items,
+                max_snippet_chars=max_snippet_chars,
+                max_total_snippet_chars=max_total_snippet_chars,
+                compact_mode=self.compact_mode,
+                order=self.order,
+                roles=self.roles,
+            )
+        )
+
+        evidence = tuple(_transcript_match_to_evidence(match) for match in result.matches)
+        warnings = list(result.warnings)
+        if result.dropped_match_count:
+            warnings.append(
+                f"transcript search dropped {result.dropped_match_count} matches"
+            )
+        if result.truncated:
+            warnings.append("transcript search results were truncated")
+        return _collection_result(
+            request,
+            source_id=self.source_id,
+            evidence=evidence,
+            warnings=tuple(warnings),
+            truncated=result.truncated,
+            metadata={
+                "scanned_entry_count": result.scanned_entry_count,
+                "matched_entry_count": result.matched_entry_count,
+                "dropped_match_count": result.dropped_match_count,
+                "scope_count": len(result.scopes_searched),
+                "read_count": len(result.read_stats),
+            },
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ImprovementTaskOutputEvidenceTarget:
+    """One explicit task-output read target for improvement evidence."""
+
+    task_id: str
+    mode: ImprovementTaskOutputReadMode = "tail"
+    offset: int | None = None
+    max_bytes: int | None = None
+    metadata: Mapping[str, FrozenJson] = field(default_factory=_empty_metadata)
+
+    def __post_init__(self) -> None:
+        _require_bounded_non_empty(
+            self.task_id,
+            "ImprovementTaskOutputEvidenceTarget.task_id",
+            DEFAULT_MAX_EVIDENCE_COLLECTION_SOURCE_URI_CHARS,
+            "DEFAULT_MAX_EVIDENCE_COLLECTION_SOURCE_URI_CHARS",
+        )
+        _require_literal(
+            self.mode,
+            _TASK_OUTPUT_READ_MODES,
+            "ImprovementTaskOutputEvidenceTarget.mode",
+        )
+        if self.mode == "range":
+            if self.offset is None:
+                raise ImprovementRuntimeValidationError(
+                    "ImprovementTaskOutputEvidenceTarget.offset is required for range reads"
+                )
+            _require_minimum(
+                self.offset,
+                0,
+                "ImprovementTaskOutputEvidenceTarget.offset",
+            )
+        elif self.offset is not None:
+            raise ImprovementRuntimeValidationError(
+                "ImprovementTaskOutputEvidenceTarget.offset is only valid for range reads"
+            )
+        if self.max_bytes is not None:
+            _require_minimum(
+                self.max_bytes,
+                1,
+                "ImprovementTaskOutputEvidenceTarget.max_bytes",
+            )
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_metadata(
+                self.metadata,
+                "ImprovementTaskOutputEvidenceTarget.metadata",
+                DEFAULT_MAX_EVIDENCE_COLLECTION_ITEM_METADATA_CHARS,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskOutputImprovementEvidenceAdapter:
+    """Read explicit bounded task-output targets into improvement evidence."""
+
+    store: TaskOutputStore
+    targets: tuple[ImprovementTaskOutputEvidenceTarget, ...]
+    source_id: str = "task_output"
+
+    def __post_init__(self) -> None:
+        targets = tuple(self.targets)
+        if not targets:
+            raise ImprovementRuntimeValidationError(
+                "TaskOutputImprovementEvidenceAdapter requires explicit targets"
+            )
+        object.__setattr__(self, "targets", targets)
+        _require_non_empty(
+            self.source_id,
+            "TaskOutputImprovementEvidenceAdapter.source_id",
+        )
+
+    async def collect(
+        self,
+        request: ImprovementEvidenceCollectionRequest,
+    ) -> ImprovementEvidenceCollectionResult:
+        """Read only construction-time task-output targets."""
+
+        if not _source_requested(request, "task_output"):
+            return _collection_result(request, source_id=self.source_id)
+
+        evidence: list[ImprovementEvidence] = []
+        warnings: list[str] = []
+        truncated = False
+        for target in self.targets:
+            max_bytes = _task_output_max_bytes(target, request.bounds)
+            if target.mode == "tail":
+                read = await self.store.read_tail(target.task_id, max_bytes=max_bytes)
+            else:
+                read = await self.store.read_range(
+                    target.task_id,
+                    offset=target.offset or 0,
+                    max_bytes=max_bytes,
+                )
+            if read.bytes_read == 0:
+                warnings.append(f"task output empty or unavailable: {target.task_id}")
+                continue
+            excerpt, excerpt_truncated = _truncate_text(
+                read.content.decode("utf-8", errors="replace"),
+                request.bounds.max_excerpt_chars,
+            )
+            if not excerpt.strip():
+                warnings.append(f"task output empty or unavailable: {target.task_id}")
+                continue
+            truncated = (
+                truncated
+                or read.truncated_before
+                or read.truncated_after
+                or excerpt_truncated
+            )
+            safe_task_id = _safe_uri_component(target.task_id)
+            evidence.append(
+                ImprovementEvidence(
+                    evidence_id=(
+                        f"iev_task_output_{safe_task_id}_"
+                        f"{read.start_offset}_{read.next_offset}"
+                    ),
+                    source="task_output",
+                    summary=f"Task output {target.mode} read for {target.task_id}",
+                    excerpt=excerpt,
+                    source_uri=(
+                        f"task-output://{safe_task_id}?"
+                        f"start={read.start_offset}&next={read.next_offset}"
+                    ),
+                    created_at=0.0,
+                    metadata={
+                        "task_id": target.task_id,
+                        "read_mode": target.mode,
+                        "start_offset": read.start_offset,
+                        "next_offset": read.next_offset,
+                        "bytes_read": read.bytes_read,
+                        "bytes_total": read.bytes_total,
+                        "truncated_before": read.truncated_before,
+                        "truncated_after": read.truncated_after or excerpt_truncated,
+                        "target_metadata": target.metadata,
+                    },
+                )
+            )
+        return _collection_result(
+            request,
+            source_id=self.source_id,
+            evidence=tuple(evidence),
+            warnings=tuple(warnings),
+            truncated=truncated,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ImprovementObservabilitySnapshot:
+    """Caller-supplied metadata snapshot for observability evidence."""
+
+    event_id: str
+    event_type: str
+    summary: str
+    created_at: float | None = None
+    source_uri: str | None = None
+    metadata: Mapping[str, FrozenJson] = field(default_factory=_empty_metadata)
+
+    def __post_init__(self) -> None:
+        _require_bounded_non_empty(
+            self.event_id,
+            "ImprovementObservabilitySnapshot.event_id",
+            DEFAULT_MAX_EVIDENCE_COLLECTION_SOURCE_URI_CHARS,
+            "DEFAULT_MAX_EVIDENCE_COLLECTION_SOURCE_URI_CHARS",
+        )
+        _require_bounded_non_empty(
+            self.event_type,
+            "ImprovementObservabilitySnapshot.event_type",
+            DEFAULT_MAX_EVIDENCE_COLLECTION_SOURCE_URI_CHARS,
+            "DEFAULT_MAX_EVIDENCE_COLLECTION_SOURCE_URI_CHARS",
+        )
+        _require_non_empty(self.summary, "ImprovementObservabilitySnapshot.summary")
+        if self.created_at is not None and self.created_at < 0:
+            raise ValueError("ImprovementObservabilitySnapshot.created_at must be >= 0")
+        if self.source_uri is not None:
+            _require_bounded_non_empty(
+                self.source_uri,
+                "ImprovementObservabilitySnapshot.source_uri",
+                DEFAULT_MAX_EVIDENCE_COLLECTION_SOURCE_URI_CHARS,
+                "DEFAULT_MAX_EVIDENCE_COLLECTION_SOURCE_URI_CHARS",
+            )
+        _reject_raw_observability_metadata(
+            self.metadata,
+            "ImprovementObservabilitySnapshot.metadata",
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_metadata(
+                self.metadata,
+                "ImprovementObservabilitySnapshot.metadata",
+                DEFAULT_MAX_EVIDENCE_COLLECTION_ITEM_METADATA_CHARS,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ObservabilitySnapshotImprovementEvidenceAdapter:
+    """Convert caller-supplied observability snapshots into evidence."""
+
+    snapshots: tuple[ImprovementObservabilitySnapshot, ...]
+    source_id: str = "observability"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "snapshots", tuple(self.snapshots))
+        _require_non_empty(
+            self.source_id,
+            "ObservabilitySnapshotImprovementEvidenceAdapter.source_id",
+        )
+
+    async def collect(
+        self,
+        request: ImprovementEvidenceCollectionRequest,
+    ) -> ImprovementEvidenceCollectionResult:
+        """Return metadata-only observability snapshots selected by the caller."""
+
+        if not _source_requested(request, "observability"):
+            return _collection_result(request, source_id=self.source_id)
+
+        evidence = tuple(
+            ImprovementEvidence(
+                evidence_id=f"iev_observability_{_safe_uri_component(snapshot.event_id)}",
+                source="observability",
+                summary=snapshot.summary,
+                source_uri=snapshot.source_uri
+                or (
+                    "observability://"
+                    f"{_safe_uri_component(snapshot.event_type)}/"
+                    f"{_safe_uri_component(snapshot.event_id)}"
+                ),
+                created_at=snapshot.created_at if snapshot.created_at is not None else 0.0,
+                metadata={
+                    "event_id": snapshot.event_id,
+                    "event_type": snapshot.event_type,
+                    "snapshot_metadata": snapshot.metadata,
+                },
+            )
+            for snapshot in self.snapshots
+        )
+        return _collection_result(
+            request,
+            source_id=self.source_id,
+            evidence=evidence,
+            truncated=False,
+            metadata={"snapshot_count": len(self.snapshots)},
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1004,6 +1403,151 @@ def improvement_evidence_collection_result_from_dict(
     )
 
 
+def _collection_result(
+    request: ImprovementEvidenceCollectionRequest,
+    *,
+    source_id: str,
+    evidence: Sequence[ImprovementEvidence] = (),
+    warnings: Sequence[str] = (),
+    truncated: bool = False,
+    metadata: Mapping[str, FrozenJson] | None = None,
+) -> ImprovementEvidenceCollectionResult:
+    result = ImprovementEvidenceCollectionResult(
+        request_id=request.request_id,
+        session_id=request.session_id,
+        runtime_session_id=request.runtime_session_id,
+        source_id=source_id,
+        evidence=tuple(evidence),
+        warnings=tuple(warnings),
+        truncated=truncated,
+        metadata=_empty_metadata() if metadata is None else metadata,
+    )
+    _validate_collection_result_linkage(request, result)
+    return result
+
+
+def _source_requested(
+    request: ImprovementEvidenceCollectionRequest,
+    source: ImprovementEvidenceSource,
+) -> bool:
+    return not request.source_kinds or source in request.source_kinds
+
+
+def _transcript_search_budget(
+    bounds: ImprovementEvidenceCollectionBounds,
+) -> tuple[int, int] | str:
+    max_total_snippet_chars = min(
+        bounds.max_total_chars // 2,
+        bounds.proposal_evidence_bounds.max_total_text_chars // 2,
+    )
+    if max_total_snippet_chars < TRANSCRIPT_SEARCH_MIN_SNIPPET_CHARS:
+        return (
+            "transcript evidence bounds cannot satisfy "
+            "TranscriptSearchRequest.max_snippet_chars >= 16"
+        )
+    max_snippet_chars = min(
+        bounds.max_excerpt_chars,
+        bounds.proposal_evidence_bounds.max_item_text_chars,
+        max_total_snippet_chars,
+    )
+    if max_snippet_chars < TRANSCRIPT_SEARCH_MIN_SNIPPET_CHARS:
+        return (
+            "transcript evidence bounds cannot satisfy "
+            "TranscriptSearchRequest.max_snippet_chars >= 16"
+        )
+    return max_snippet_chars, max_total_snippet_chars
+
+
+def _transcript_match_to_evidence(
+    match: TranscriptSearchMatch,
+) -> ImprovementEvidence:
+    return ImprovementEvidence(
+        evidence_id=f"iev_transcript_{_safe_uri_component(match.entry_id)}",
+        source="transcript",
+        summary=f"Transcript {match.role or 'message'} match from {match.entry_id}",
+        excerpt=match.snippet,
+        source_uri=(
+            "transcript://"
+            f"{_safe_uri_component(match.session_id)}/"
+            f"{_safe_uri_component(match.entry_id)}"
+        ),
+        created_at=match.created_at,
+        metadata={
+            "session_id": match.session_id,
+            "runtime_session_id": match.runtime_session_id,
+            "entry_id": match.entry_id,
+            "role": match.role,
+            "score": match.score,
+            "order": match.order,
+            "agent_id": match.agent_id,
+            "is_sidechain": match.is_sidechain,
+            "snippet_truncated": match.snippet_truncated,
+        },
+    )
+
+
+def _task_output_max_bytes(
+    target: ImprovementTaskOutputEvidenceTarget,
+    bounds: ImprovementEvidenceCollectionBounds,
+) -> int:
+    if target.max_bytes is None:
+        return bounds.max_excerpt_chars
+    return min(target.max_bytes, bounds.max_excerpt_chars)
+
+
+def _truncate_text(text: str, max_chars: int) -> tuple[str, bool]:
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
+def _safe_uri_component(value: str, *, max_chars: int = 120) -> str:
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+    cleaned = "".join(char if char in allowed else "_" for char in value).strip("._-")
+    digest = sha256(value.encode("utf-8")).hexdigest()[:12]
+    if not cleaned:
+        cleaned = f"id-{digest}"
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return f"{cleaned[: max_chars - 13]}-{digest}"
+
+
+def _reject_raw_observability_metadata(value: object, name: str) -> None:
+    if isinstance(value, Mapping):
+        for key, item in cast(Mapping[object, object], value).items():
+            key_text = str(key)
+            child_name = f"{name}.{key_text}"
+            if key_text in _RAW_OBSERVABILITY_METADATA_KEYS:
+                if _is_redaction_marker(item):
+                    continue
+                raise ImprovementRuntimeValidationError(
+                    f"{child_name} must be a bounded redaction marker"
+                )
+            _reject_raw_observability_metadata(item, child_name)
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        for index, item in enumerate(cast(Sequence[object], value)):
+            _reject_raw_observability_metadata(item, f"{name}[{index}]")
+
+
+def _is_redaction_marker(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    marker = cast(Mapping[object, object], value)
+    if marker.get("redacted") is not True:
+        return False
+    for key, item in marker.items():
+        key_text = str(key)
+        if key_text not in _REDACTION_MARKER_KEYS:
+            return False
+        if key_text == "redacted":
+            continue
+        if isinstance(item, Mapping):
+            return False
+        if isinstance(item, Sequence) and not isinstance(item, str | bytes | bytearray):
+            return False
+    return True
+
+
 def _runtime_result(
     request: ImprovementRuntimeRequest,
     *,
@@ -1273,11 +1817,13 @@ __all__ = (
     "DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS",
     "DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNING_CHARS",
     "IMPROVEMENT_RUNTIME_RECORD_SCHEMA_VERSION",
+    "TRANSCRIPT_SEARCH_MIN_SNIPPET_CHARS",
     "BoundedImprovementEvidenceCollection",
     "ImprovementEvidenceCollectionBounds",
     "ImprovementEvidenceCollectionRequest",
     "ImprovementEvidenceCollectionResult",
     "ImprovementEvidenceSourceAdapter",
+    "ImprovementObservabilitySnapshot",
     "ImprovementRecordStore",
     "ImprovementRuntimeBridge",
     "ImprovementRuntimeBridgeConfig",
@@ -1289,6 +1835,11 @@ __all__ = (
     "ImprovementRuntimeTransitionResult",
     "ImprovementRuntimeTransitionStatus",
     "ImprovementRuntimeValidationError",
+    "ImprovementTaskOutputEvidenceTarget",
+    "ImprovementTaskOutputReadMode",
+    "ObservabilitySnapshotImprovementEvidenceAdapter",
+    "TaskOutputImprovementEvidenceAdapter",
+    "TranscriptSearchImprovementEvidenceAdapter",
     "improvement_evidence_collection_result_from_dict",
     "improvement_evidence_collection_result_to_dict",
     "improvement_runtime_chain_summary_from_dict",

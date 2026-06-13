@@ -672,11 +672,18 @@ Optional improvement runtime bridge:
   - `DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS`
   - `DEFAULT_MAX_IMPROVEMENT_RUNTIME_STOP_REASON_CHARS`
   - `DEFAULT_MAX_IMPROVEMENT_RUNTIME_SUMMARY_RECORDS`
+  - `TRANSCRIPT_SEARCH_MIN_SNIPPET_CHARS`
   - `ImprovementEvidenceCollectionBounds`
   - `ImprovementEvidenceCollectionRequest`
   - `ImprovementEvidenceCollectionResult`
   - `BoundedImprovementEvidenceCollection`
   - `ImprovementEvidenceSourceAdapter`
+  - `TranscriptSearchImprovementEvidenceAdapter`
+  - `ImprovementTaskOutputReadMode`
+  - `ImprovementTaskOutputEvidenceTarget`
+  - `TaskOutputImprovementEvidenceAdapter`
+  - `ImprovementObservabilitySnapshot`
+  - `ObservabilitySnapshotImprovementEvidenceAdapter`
   - `ImprovementRecordStore`
   - `ImprovementRuntimeBridge`
   - `ImprovementRuntimeBridgeConfig`
@@ -696,25 +703,38 @@ Optional improvement runtime bridge:
   - `improvement_runtime_chain_summary_to_dict(...)`
   - `improvement_runtime_chain_summary_from_dict(...)`
 
-`raygent_harness.services.improvement_runtime` is the RSI-006A service-layer
+`raygent_harness.services.improvement_runtime` is the RSI-006 service-layer
 contract surface. `ImprovementRuntimeBridge` is inert unless a caller constructs
 and invokes it with `ImprovementRuntimeBridgeConfig(enabled=True)`. It can
 perform one explicit transition and return `completed`, `blocked`, or `not_enabled`,
-but it does not decide to keep improving. In RSI-006A it can collect evidence only
-through caller-owned `ImprovementEvidenceSourceAdapter`
-instances and can append chain envelopes only through a caller-owned
-`ImprovementRecordStore`. Raygent does not ship concrete transcript, task
-output, observability, filesystem, Git, network, CI, or tool adapters in this
+but it does not decide to keep improving. It can collect evidence through
+caller-owned `ImprovementEvidenceSourceAdapter` instances, including the
+bounded `TranscriptSearchImprovementEvidenceAdapter`,
+`TaskOutputImprovementEvidenceAdapter`, and
+`ObservabilitySnapshotImprovementEvidenceAdapter` helpers, and it can append
+chain envelopes only through a caller-owned `ImprovementRecordStore`.
+Raygent does not ship a concrete improvement record store, filesystem writer,
+Git promoter, network client, CI client, or tool-invocation adapter in this
 layer.
 
-The bridge defines `ImprovementEvidenceCollectionBounds` before concrete
-adapters land so transcript snippets, task-output reads, observability
-summaries, verification records, user reports, and usage summaries can later be
-converted into existing `ImprovementEvidence` without reading or storing raw
-full sources by default. Runtime records use
+The bridge defines `ImprovementEvidenceCollectionBounds` so transcript
+snippets, task-output reads, observability summaries, verification records,
+user reports, and usage summaries can be converted into existing
+`ImprovementEvidence` without reading or storing raw full sources by default.
+`TranscriptSearchImprovementEvidenceAdapter` reserves transcript search budget
+for serialized evidence-wrapper overhead and returns an empty warning result
+when collection bounds cannot satisfy transcript-search snippet minima.
+`TaskOutputImprovementEvidenceAdapter` requires explicit
+`ImprovementTaskOutputEvidenceTarget` records at adapter construction and reads
+only bounded tail or range data through an injected `TaskOutputStore`.
+`ObservabilitySnapshotImprovementEvidenceAdapter` consumes caller-supplied
+`ImprovementObservabilitySnapshot` records instead of replaying event-bus
+history and rejects raw-looking snapshot fields such as `prompt`, `content`,
+`output`, `tool_input`, `tool_result`, and `transcript` unless they are bounded
+redaction markers. Runtime records use
 `IMPROVEMENT_RUNTIME_RECORD_SCHEMA_VERSION` and bounded metadata so future
 stores and recovery code can summarize where an explicit improvement chain
-stopped and what record or permission is required next. RSI-006A does not modify `QueryEngine`,
+stopped and what record or permission is required next. RSI-006 does not modify `QueryEngine`,
 `create_raygent(...)`, `RaygentFactory`, `GoalRuntime`, or product `/goal` behavior,
 and does not invoke Raygent tools.
 

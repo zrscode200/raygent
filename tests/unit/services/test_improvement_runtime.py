@@ -22,6 +22,7 @@ from raygent_harness.services.improvement_runtime import (
     ImprovementEvidenceCollectionBounds,
     ImprovementEvidenceCollectionRequest,
     ImprovementEvidenceCollectionResult,
+    ImprovementObservabilitySnapshot,
     ImprovementRuntimeBridge,
     ImprovementRuntimeBridgeConfig,
     ImprovementRuntimeChainSummary,
@@ -30,6 +31,10 @@ from raygent_harness.services.improvement_runtime import (
     ImprovementRuntimeRequest,
     ImprovementRuntimeTransitionResult,
     ImprovementRuntimeValidationError,
+    ImprovementTaskOutputEvidenceTarget,
+    ObservabilitySnapshotImprovementEvidenceAdapter,
+    TaskOutputImprovementEvidenceAdapter,
+    TranscriptSearchImprovementEvidenceAdapter,
     improvement_evidence_collection_result_from_dict,
     improvement_evidence_collection_result_to_dict,
     improvement_runtime_chain_summary_from_dict,
@@ -37,6 +42,17 @@ from raygent_harness.services.improvement_runtime import (
     improvement_runtime_record_from_dict,
     improvement_runtime_record_to_dict,
     validate_improvement_evidence_collection,
+)
+from raygent_harness.services.task_output import (
+    TaskOutputReadResult,
+    TaskOutputReference,
+    TaskOutputStore,
+)
+from raygent_harness.services.transcript import (
+    TranscriptSearchMatch,
+    TranscriptSearchRequest,
+    TranscriptSearchResult,
+    TranscriptSearchService,
 )
 
 
@@ -159,6 +175,92 @@ class ReplacingRecordStore(FakeRecordStore):
         return replace(record, session_id="other-session")
 
 
+def _empty_search_requests() -> list[TranscriptSearchRequest]:
+    return []
+
+
+@dataclass
+class FakeTranscriptSearchService:
+    result: TranscriptSearchResult
+    requests: list[TranscriptSearchRequest] = field(default_factory=_empty_search_requests)
+
+    async def search(self, request: TranscriptSearchRequest) -> TranscriptSearchResult:
+        self.requests.append(request)
+        return self.result
+
+
+def _empty_task_reads() -> list[tuple[str, str, int, int | None]]:
+    return []
+
+
+def _empty_tail_results() -> dict[str, TaskOutputReadResult]:
+    return {}
+
+
+def _empty_range_results() -> dict[tuple[str, int], TaskOutputReadResult]:
+    return {}
+
+
+@dataclass
+class FakeTaskOutputStore:
+    tail_results: dict[str, TaskOutputReadResult] = field(
+        default_factory=_empty_tail_results
+    )
+    range_results: dict[tuple[str, int], TaskOutputReadResult] = field(
+        default_factory=_empty_range_results
+    )
+    reads: list[tuple[str, str, int, int | None]] = field(default_factory=_empty_task_reads)
+
+    async def init_task_output(self, task_id: str) -> TaskOutputReference:
+        return TaskOutputReference(task_id=task_id, store_kind="fake")
+
+    async def append_task_output(self, task_id: str, chunk: bytes) -> None:
+        _ = (task_id, chunk)
+
+    async def flush_task_output(self, task_id: str) -> None:
+        _ = task_id
+
+    async def evict_task_output(self, task_id: str) -> None:
+        _ = task_id
+
+    async def cleanup_task_output(self, task_id: str) -> None:
+        _ = task_id
+
+    async def read_tail(
+        self,
+        task_id: str,
+        *,
+        max_bytes: int = 8 * 1024 * 1024,
+    ) -> TaskOutputReadResult:
+        self.reads.append(("tail", task_id, max_bytes, None))
+        return self.tail_results.get(task_id, _empty_task_output(task_id))
+
+    async def read_range(
+        self,
+        task_id: str,
+        *,
+        offset: int,
+        max_bytes: int = 8 * 1024 * 1024,
+    ) -> TaskOutputReadResult:
+        self.reads.append(("range", task_id, max_bytes, offset))
+        return self.range_results.get((task_id, offset), _empty_task_output(task_id))
+
+    async def size(self, task_id: str) -> int:
+        read = self.tail_results.get(task_id)
+        return 0 if read is None else read.bytes_total
+
+
+def _empty_task_output(task_id: str) -> TaskOutputReadResult:
+    return TaskOutputReadResult(
+        task_id=task_id,
+        content=b"",
+        start_offset=0,
+        bytes_read=0,
+        bytes_total=0,
+        next_offset=0,
+    )
+
+
 def test_collection_bounds_compose_with_proposal_bounds() -> None:
     bounds = ImprovementEvidenceCollectionBounds(
         max_items=2,
@@ -243,6 +345,292 @@ def test_collection_request_and_result_are_serializable_contracts() -> None:
 
     assert request.source_kinds == ("transcript", "task_output")
     assert improvement_evidence_collection_result_from_dict(snapshot) == result
+
+
+@pytest.mark.asyncio
+async def test_transcript_adapter_maps_search_matches_to_bounded_evidence() -> None:
+    search = FakeTranscriptSearchService(
+        TranscriptSearchResult(
+            matches=(
+                TranscriptSearchMatch(
+                    session_id="session-1",
+                    runtime_session_id="runtime-1",
+                    entry_id="tr_1",
+                    role="assistant",
+                    snippet="bounded regression symptom",
+                    score=42,
+                    order=0,
+                    created_at=123.0,
+                    agent_id="agent-1",
+                    is_sidechain=True,
+                    source_path="/not/exported/transcript.jsonl",
+                    snippet_truncated=True,
+                ),
+            ),
+            scanned_entry_count=5,
+            matched_entry_count=2,
+            dropped_match_count=1,
+            truncated=True,
+        )
+    )
+    bounds = ImprovementEvidenceCollectionBounds(
+        max_items=2,
+        max_excerpt_chars=80,
+        max_total_chars=800,
+        proposal_evidence_bounds=ImprovementEvidenceBounds(
+            max_items=2,
+            max_item_text_chars=800,
+            max_total_text_chars=800,
+        ),
+    )
+    request = ImprovementEvidenceCollectionRequest(
+        request_id="ier_transcript",
+        session_id="session-1",
+        runtime_session_id="runtime-1",
+        source_kinds=("transcript",),
+        query="regression",
+        bounds=bounds,
+    )
+
+    result = await TranscriptSearchImprovementEvidenceAdapter(
+        cast(TranscriptSearchService, search),
+        roles=("assistant",),
+        sidechain_agent_ids=("agent-1",),
+        include_main=False,
+    ).collect(request)
+
+    assert result.request_id == request.request_id
+    assert result.runtime_session_id == "runtime-1"
+    assert len(search.requests) == 1
+    assert search.requests[0].scope.session_id == "session-1"
+    assert search.requests[0].scope.runtime_session_id == "runtime-1"
+    assert search.requests[0].scope.include_main is False
+    assert search.requests[0].scope.sidechain_agent_ids == ("agent-1",)
+    assert search.requests[0].max_results == 2
+    assert search.requests[0].max_snippet_chars == 80
+    assert search.requests[0].max_total_snippet_chars == 400
+    assert result.evidence[0].source == "transcript"
+    assert result.evidence[0].evidence_id == "iev_transcript_tr_1"
+    assert result.evidence[0].source_uri == "transcript://session-1/tr_1"
+    assert result.evidence[0].metadata["entry_id"] == "tr_1"
+    assert "source_path" not in result.evidence[0].metadata
+    assert result.truncated is True
+    assert result.warnings == (
+        "transcript search dropped 1 matches",
+        "transcript search results were truncated",
+    )
+
+
+@pytest.mark.asyncio
+async def test_transcript_adapter_fails_closed_for_filters_query_and_tight_bounds() -> None:
+    search = FakeTranscriptSearchService(TranscriptSearchResult())
+    adapter = TranscriptSearchImprovementEvidenceAdapter(cast(TranscriptSearchService, search))
+
+    skipped = await adapter.collect(
+        ImprovementEvidenceCollectionRequest(
+            request_id="ier_skip",
+            session_id="session-1",
+            source_kinds=("task_output",),
+            query="ignored",
+        )
+    )
+    missing_query = await adapter.collect(
+        ImprovementEvidenceCollectionRequest(
+            request_id="ier_missing_query",
+            session_id="session-1",
+            source_kinds=("transcript",),
+        )
+    )
+    tight_bounds = await adapter.collect(
+        ImprovementEvidenceCollectionRequest(
+            request_id="ier_tight",
+            session_id="session-1",
+            source_kinds=("transcript",),
+            query="regression",
+            bounds=ImprovementEvidenceCollectionBounds(
+                max_items=1,
+                max_excerpt_chars=8,
+                max_total_chars=100,
+                proposal_evidence_bounds=ImprovementEvidenceBounds(
+                    max_items=1,
+                    max_item_text_chars=100,
+                    max_total_text_chars=100,
+                ),
+            ),
+        )
+    )
+
+    assert skipped.evidence == ()
+    assert skipped.warnings == ()
+    assert missing_query.evidence == ()
+    assert missing_query.warnings == ("transcript evidence query is required",)
+    assert tight_bounds.evidence == ()
+    assert "max_snippet_chars >= 16" in tight_bounds.warnings[0]
+    assert search.requests == []
+
+
+@pytest.mark.asyncio
+async def test_task_output_adapter_requires_targets_and_reads_only_explicit_bounds() -> None:
+    with pytest.raises(ImprovementRuntimeValidationError, match="explicit targets"):
+        TaskOutputImprovementEvidenceAdapter(cast(TaskOutputStore, FakeTaskOutputStore()), ())
+
+    store = FakeTaskOutputStore(
+        tail_results={
+            "task-a": TaskOutputReadResult(
+                task_id="task-a",
+                content=b"older line\ncurrent failure",
+                start_offset=5,
+                bytes_read=25,
+                bytes_total=30,
+                next_offset=30,
+                truncated_before=True,
+            )
+        },
+        range_results={
+            ("task-b", 4): TaskOutputReadResult(
+                task_id="task-b",
+                content=b"range bytes",
+                start_offset=4,
+                bytes_read=11,
+                bytes_total=40,
+                next_offset=15,
+                truncated_before=True,
+                truncated_after=True,
+            )
+        },
+    )
+    adapter = TaskOutputImprovementEvidenceAdapter(
+        cast(TaskOutputStore, store),
+        (
+            ImprovementTaskOutputEvidenceTarget("task-a", max_bytes=12),
+            ImprovementTaskOutputEvidenceTarget(
+                "task-b",
+                mode="range",
+                offset=4,
+                metadata={"kind": "verification-log"},
+            ),
+        ),
+    )
+
+    result = await adapter.collect(
+        ImprovementEvidenceCollectionRequest(
+            request_id="ier_task_output",
+            session_id="session-1",
+            runtime_session_id="runtime-1",
+            source_kinds=("task_output",),
+            bounds=ImprovementEvidenceCollectionBounds(max_excerpt_chars=20),
+        )
+    )
+
+    assert store.reads == [("tail", "task-a", 12, None), ("range", "task-b", 20, 4)]
+    assert result.runtime_session_id == "runtime-1"
+    assert [item.source for item in result.evidence] == ["task_output", "task_output"]
+    assert result.evidence[0].excerpt == "older line\ncurrent f"
+    assert result.evidence[0].metadata["truncated_before"] is True
+    assert result.evidence[0].metadata["truncated_after"] is True
+    assert result.evidence[0].source_uri == "task-output://task-a?start=5&next=30"
+    assert result.evidence[1].metadata["target_metadata"] == {
+        "kind": "verification-log"
+    }
+    assert result.truncated is True
+
+
+@pytest.mark.asyncio
+async def test_task_output_adapter_honors_source_filters_and_missing_output() -> None:
+    store = FakeTaskOutputStore()
+    adapter = TaskOutputImprovementEvidenceAdapter(
+        cast(TaskOutputStore, store),
+        (ImprovementTaskOutputEvidenceTarget("missing-task"),),
+    )
+
+    skipped = await adapter.collect(
+        ImprovementEvidenceCollectionRequest(
+            request_id="ier_skip_task",
+            session_id="session-1",
+            source_kinds=("transcript",),
+            query="ignored",
+        )
+    )
+    missing = await adapter.collect(
+        ImprovementEvidenceCollectionRequest(
+            request_id="ier_missing_task",
+            session_id="session-1",
+            source_kinds=("task_output",),
+        )
+    )
+
+    assert skipped.evidence == ()
+    assert store.reads == [("tail", "missing-task", 1000, None)]
+    assert missing.evidence == ()
+    assert missing.warnings == ("task output empty or unavailable: missing-task",)
+
+
+@pytest.mark.asyncio
+async def test_observability_snapshot_adapter_accepts_metadata_only_snapshots() -> None:
+    adapter = ObservabilitySnapshotImprovementEvidenceAdapter(
+        (
+            ImprovementObservabilitySnapshot(
+                event_id="event-1",
+                event_type="model_usage",
+                summary="Model usage crossed the configured budget.",
+                created_at=456.0,
+                metadata={
+                    "tokens": 1_200,
+                    "tool_result": {
+                        "redacted": True,
+                        "summary": "raw tool result intentionally omitted",
+                    },
+                },
+            ),
+        )
+    )
+
+    result = await adapter.collect(
+        ImprovementEvidenceCollectionRequest(
+            request_id="ier_observability",
+            session_id="session-1",
+            runtime_session_id="runtime-1",
+            source_kinds=("observability",),
+        )
+    )
+
+    assert result.runtime_session_id == "runtime-1"
+    assert result.evidence[0].source == "observability"
+    assert result.evidence[0].source_uri == "observability://model_usage/event-1"
+    assert result.evidence[0].created_at == 456.0
+    assert result.evidence[0].metadata["event_type"] == "model_usage"
+
+
+def test_observability_snapshot_rejects_raw_looking_content_fields() -> None:
+    with pytest.raises(ImprovementRuntimeValidationError, match="content"):
+        ImprovementObservabilitySnapshot(
+            event_id="event-1",
+            event_type="message",
+            summary="Raw content should not enter improvement evidence.",
+            metadata={"content": "full prompt or response"},
+        )
+
+    with pytest.raises(ImprovementRuntimeValidationError, match="transcript"):
+        ImprovementObservabilitySnapshot(
+            event_id="event-2",
+            event_type="message",
+            summary="Nested raw transcript should not enter improvement evidence.",
+            metadata={"nested": {"transcript": "full transcript"}},
+        )
+
+    with pytest.raises(ImprovementRuntimeValidationError, match="tool_result"):
+        ImprovementObservabilitySnapshot(
+            event_id="event-3",
+            event_type="tool",
+            summary="Redaction markers must not smuggle raw payload fields.",
+            metadata={
+                "tool_result": {
+                    "redacted": True,
+                    "summary": "raw payload omitted",
+                    "content": "raw tool output",
+                }
+            },
+        )
 
 
 def test_runtime_request_adopts_collection_runtime_session_id() -> None:
