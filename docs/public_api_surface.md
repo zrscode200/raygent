@@ -648,6 +648,76 @@ allocation, injected-materialization, data-only outcome/archive-decision, and
 verification-planning-only, injected archive-store, and injected
 promotion-attempt boundary.
 
+Optional improvement runtime bridge:
+
+- `raygent_harness.services.improvement_runtime`
+  - optional runtime bridge contracts for explicit caller invocation only
+  - versioned immutable improvement-chain envelopes with bounded metadata,
+    warnings, stop reasons, payloads, and payload references
+  - bounded recovery-summary records for product-layer and recovery decisions,
+    without integrating `RuntimeRecoveryService` yet
+  - injectable evidence source adapters and an injectable record-store protocol
+    that are absent by default
+  - `IMPROVEMENT_RUNTIME_RECORD_SCHEMA_VERSION`
+  - `DEFAULT_MAX_EVIDENCE_COLLECTION_ITEMS`
+  - `DEFAULT_MAX_EVIDENCE_COLLECTION_EXCERPT_CHARS`
+  - `DEFAULT_MAX_EVIDENCE_COLLECTION_SOURCE_URI_CHARS`
+  - `DEFAULT_MAX_EVIDENCE_COLLECTION_ITEM_METADATA_CHARS`
+  - `DEFAULT_MAX_EVIDENCE_COLLECTION_TOTAL_METADATA_CHARS`
+  - `DEFAULT_MAX_EVIDENCE_COLLECTION_WARNINGS`
+  - `DEFAULT_MAX_EVIDENCE_COLLECTION_TOTAL_CHARS`
+  - `DEFAULT_MAX_IMPROVEMENT_RUNTIME_METADATA_CHARS`
+  - `DEFAULT_MAX_IMPROVEMENT_RUNTIME_PAYLOAD_REF_CHARS`
+  - `DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNING_CHARS`
+  - `DEFAULT_MAX_IMPROVEMENT_RUNTIME_WARNINGS`
+  - `DEFAULT_MAX_IMPROVEMENT_RUNTIME_STOP_REASON_CHARS`
+  - `DEFAULT_MAX_IMPROVEMENT_RUNTIME_SUMMARY_RECORDS`
+  - `ImprovementEvidenceCollectionBounds`
+  - `ImprovementEvidenceCollectionRequest`
+  - `ImprovementEvidenceCollectionResult`
+  - `BoundedImprovementEvidenceCollection`
+  - `ImprovementEvidenceSourceAdapter`
+  - `ImprovementRecordStore`
+  - `ImprovementRuntimeBridge`
+  - `ImprovementRuntimeBridgeConfig`
+  - `ImprovementRuntimeRequest`
+  - `ImprovementRuntimeTransitionResult`
+  - `ImprovementRuntimeTransitionStatus`
+  - `ImprovementRuntimeRecord`
+  - `ImprovementRuntimeRecordKind`
+  - `ImprovementRuntimeRecordQuery`
+  - `ImprovementRuntimeChainSummary`
+  - `ImprovementRuntimeValidationError`
+  - `validate_improvement_evidence_collection(...)`
+  - `improvement_evidence_collection_result_to_dict(...)`
+  - `improvement_evidence_collection_result_from_dict(...)`
+  - `improvement_runtime_record_to_dict(...)`
+  - `improvement_runtime_record_from_dict(...)`
+  - `improvement_runtime_chain_summary_to_dict(...)`
+  - `improvement_runtime_chain_summary_from_dict(...)`
+
+`raygent_harness.services.improvement_runtime` is the RSI-006A service-layer
+contract surface. `ImprovementRuntimeBridge` is inert unless a caller constructs
+and invokes it with `ImprovementRuntimeBridgeConfig(enabled=True)`. It can
+perform one explicit transition and return `completed`, `blocked`, or `not_enabled`,
+but it does not decide to keep improving. In RSI-006A it can collect evidence only
+through caller-owned `ImprovementEvidenceSourceAdapter`
+instances and can append chain envelopes only through a caller-owned
+`ImprovementRecordStore`. Raygent does not ship concrete transcript, task
+output, observability, filesystem, Git, network, CI, or tool adapters in this
+layer.
+
+The bridge defines `ImprovementEvidenceCollectionBounds` before concrete
+adapters land so transcript snippets, task-output reads, observability
+summaries, verification records, user reports, and usage summaries can later be
+converted into existing `ImprovementEvidence` without reading or storing raw
+full sources by default. Runtime records use
+`IMPROVEMENT_RUNTIME_RECORD_SCHEMA_VERSION` and bounded metadata so future
+stores and recovery code can summarize where an explicit improvement chain
+stopped and what record or permission is required next. RSI-006A does not modify `QueryEngine`,
+`create_raygent(...)`, `RaygentFactory`, `GoalRuntime`, or product `/goal` behavior,
+and does not invoke Raygent tools.
+
 Worktrees and remote-agent seam:
 
 - `raygent_harness.services.worktree`
