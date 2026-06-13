@@ -356,6 +356,10 @@ Bounded improvement proposals and gates:
   - verification planning records derive bounded checks from a candidate plan
     plus materialization and copy `materialization.changed_files` into
     `allowed_changed_files` without invoking a runner
+  - injected verifier protocol uses a caller-owned `ImprovementPatchCandidateVerifier`
+    to record verification results with explicit call-time `shell` and
+    `filesystem_mutation` approval, `status == "verification_recorded"`, and a
+    service-owned `verification_digest`
   - data-only outcome/archive-decision records derive bounded post-evaluation
     decisions without promotion or archive persistence authority
   - injected archive persistence requires explicit call-time approval and a
@@ -457,6 +461,14 @@ Bounded improvement proposals and gates:
   - `ImprovementPatchCandidateVerificationCheck`
   - `ImprovementPatchCandidateVerificationPlan`
   - `ImprovementPatchCandidateVerificationPlanner`
+  - `ImprovementPatchCandidateVerificationStatus`
+  - `ImprovementPatchCandidateVerificationApproval`
+  - `ImprovementPatchCandidateVerificationRequest`
+  - `ImprovementPatchCandidateVerificationCheckResult`
+  - `ImprovementPatchCandidateVerificationResult`
+  - `ImprovementPatchCandidateVerifier`
+  - `ImprovementPatchCandidateVerificationRecord`
+  - `ImprovementPatchCandidateVerificationService`
   - `ImprovementPatchCandidateOutcomeError`
   - `ImprovementPatchCandidateOutcomeValidationError`
   - `ImprovementPatchCandidateArchiveError`
@@ -521,6 +533,15 @@ Bounded improvement proposals and gates:
   - `improvement_patch_candidate_verification_check_from_dict(...)`
   - `improvement_patch_candidate_verification_plan_to_dict(...)`
   - `improvement_patch_candidate_verification_plan_from_dict(...)`
+  - `improvement_patch_candidate_verification_request_to_dict(...)`
+  - `improvement_patch_candidate_verification_request_from_dict(...)`
+  - `improvement_patch_candidate_verification_check_result_to_dict(...)`
+  - `improvement_patch_candidate_verification_check_result_from_dict(...)`
+  - `improvement_patch_candidate_verification_result_to_dict(...)`
+  - `improvement_patch_candidate_verification_result_from_dict(...)`
+  - `improvement_patch_candidate_verification_record_to_dict(...)`
+  - `improvement_patch_candidate_verification_record_from_dict(...)`
+  - `improvement_patch_candidate_verification_record_to_evaluation(...)`
   - `improvement_diagnosis_to_dict(...)`
   - `improvement_diagnosis_from_dict(...)`
   - `improvement_evaluation_check_to_dict(...)`
@@ -533,10 +554,11 @@ Bounded improvement proposals and gates:
   - `improvement_run_from_dict(...)`
 
 The improvement package is an RSI-001/RSI-002A/RSI-002B/RSI-003A/RSI-003B/
-RSI-003C/RSI-004A/RSI-004B/RSI-004C/RSI-005A contract surface. It produces
-structured proposal records from bounded evidence, can derive reviewable gate
-decisions from caller-supplied gate results, and can optionally ask an injected
-model provider for proposal JSON through `ImprovementModelGenerator`.
+RSI-003C/RSI-004A/RSI-004B/RSI-004C/RSI-005A/RSI-005B contract surface. It
+produces structured proposal records from bounded evidence, can derive
+reviewable gate decisions from caller-supplied gate results, and can optionally
+ask an injected model provider for proposal JSON through
+`ImprovementModelGenerator`.
 The proposal records and gate layer does not mutate files.
 It does not execute shell commands, call models, request permissions, commit,
 promote candidates, train models, or parse product `/goal` commands.
@@ -575,6 +597,18 @@ checks from `ImprovementEvaluationPlan`, and returns
 `status == "verification_planned"`. Verification plan records do not run
 checks, invoke a verifier, execute shell commands, call CI, install
 dependencies, mutate files, commit, promote candidates, or clean worktrees.
+`ImprovementPatchCandidateVerificationService` then records injected verifier
+results through an injected verifier protocol. It requires a caller-owned
+`ImprovementPatchCandidateVerifier`; Raygent does not ship a concrete shell
+runner, test runner, CI client, dependency installer, or filesystem executor for
+this layer. The service requires explicit call-time `shell` and
+`filesystem_mutation` approval, invokes the verifier once with a bounded
+request, validates exact check coverage, keeps changed files within
+`allowed_changed_files`, stores `status == "verification_recorded"`, and
+computes a service-owned `verification_digest` separate from the materialization
+`patch_digest`. Verification approvals are not serialized as durable reusable
+authority, and verification records can be converted into existing supplied
+evaluation records for outcome policy.
 The improvement package still does not execute shell commands, commit, promote
 candidates, ship a concrete archive backend, search archives, clean worktrees,
 or parse product `/goal` commands.
