@@ -194,3 +194,12 @@ def test_file_tools_overlay_requires_explicit_permission_options_after_ack() -> 
 
     assert resolved.factory_kwargs["tools"] == "file"
     assert resolved.requires_explicit_permission_options is True
+
+
+def test_goals_overlay_is_readiness_metadata_only() -> None:
+    resolved = resolve_raygent_preset("long_running_task", overlays=("goals",))
+
+    assert "goals_ready" in resolved.enabled_capabilities
+    assert "goal runtime installer" in resolved.required_options
+    assert "Goal runtime is not a product /goal command parser." in resolved.safety_notes
+    assert "goal_runtime_options" not in resolved.factory_kwargs

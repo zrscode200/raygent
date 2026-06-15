@@ -39,7 +39,7 @@ from raygent_harness.goals import (
     GoalSpec,
     JsonGoalStore,
 )
-from raygent_harness.sdk import create_raygent
+from raygent_harness.sdk import RaygentGoalRuntimeOptions, create_raygent
 
 
 def goal_completed_tool_message(reason: str) -> MessageParam:
@@ -112,11 +112,14 @@ class ProductGoalController:
             session_id="product-session",
             tools="none",
             context="none",
+            goal_runtime_options=RaygentGoalRuntimeOptions(
+                store=JsonGoalStore(project_root=self.project_root),
+            ),
         )
-        return GoalRuntime(
-            session,
-            store=JsonGoalStore(project_root=self.project_root),
-        )
+        runtime = session.handles.goal_runtime
+        if runtime is None:
+            raise RuntimeError("Goal runtime was not attached to the Raygent session.")
+        return runtime
 
     def start_user_goal(self, runtime: GoalRuntime, objective: str) -> str:
         state = runtime.start(

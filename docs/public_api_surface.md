@@ -33,6 +33,7 @@ Embedding factory:
   - `RaygentPersistenceOptions`
   - `RaygentAgentOptions`
   - `RaygentObservabilityOptions`
+  - `RaygentGoalRuntimeOptions`
   - `RaygentPreset`
   - `RaygentOverlay`
   - `RaygentPresetOptions`
@@ -79,6 +80,16 @@ identity, tools/hooks/media services, context providers, permissions, memory,
 persistence, agents/coordinator/remotes, and observability. Products decide
 which concrete services to inject; the SDK does not silently enable advanced
 behaviors.
+
+`RaygentGoalRuntimeOptions` is an explicit opt-in attachment seam for
+Raygent's existing session-scoped goal runtime. Passing
+`goal_runtime_options` to `create_raygent(...)` or storing it on
+`RaygentFactoryConfig` attaches a `GoalRuntime` handle to the created session.
+Omitting it leaves `session.handles.goal_runtime` as `None`. If no `GoalStore`
+is supplied, the attached runtime uses its existing non-durable
+`InMemoryGoalStore` default. `install_on_create=False` leaves goal tools and
+goal context uninstalled until `GoalRuntime.start(...)`,
+`GoalRuntime.resume(...)`, or an explicit install call.
 
 `create_raygent(..., preset=..., overlays=...)` is available for common
 construction paths. Presets resolve to ordinary factory options and can be
@@ -153,7 +164,10 @@ Supported overlays are `transcripts`, `observability`, `memory`, `goals`,
 `compaction`, `recovery`, `task_output`, `readonly_tools`, `file_tools`,
 `bash`, `agents`, `coordinator`, `mcp`, and `worktree`. Mutating/open-world
 overlays require explicit acknowledgement through `RaygentPresetOptions` and an
-explicit permission surface; they are not enabled silently.
+explicit permission surface; they are not enabled silently. The `goals` overlay
+is readiness metadata only: it reports `goals_ready` and required installer
+metadata, but does not attach `GoalRuntime` unless the caller also supplies
+explicit `goal_runtime_options`.
 
 `RaygentSession` exposes existing kernel streams and handles rather than a
 separate runtime loop:
@@ -174,7 +188,8 @@ separate runtime loop:
   tasks in the shared task store.
 - `handles`: a `RaygentRuntimeHandles` object exposing session id, cwd, task
   store, session-scoped task-output store/path, optional transcript store,
-  transcript scope/path when available, observability bus, and abort event.
+  transcript scope/path when available, observability bus, abort event, and an
+  optional `goal_runtime` handle.
 
 Callback helpers are adapter conveniences, not a product event schema:
 
@@ -212,6 +227,25 @@ the SDK factory does not install them silently.
 Copyable construction examples live outside the runtime package under
 `recipes/create_raygent/`. Runtime library behavior remains under
 `src/raygent_harness/`.
+
+Goal runtime:
+
+- `raygent_harness.goals`
+  - `GoalContextProvider`
+  - `GoalRuntime`
+  - `GoalRuntimeConfig`
+  - `GoalRuntimeResult`
+  - `GoalRuntimeStateError`
+  - `GoalRuntimeStopReason`
+  - `GoalStore`
+  - `InMemoryGoalStore`
+  - `JsonGoalStore`
+
+`GoalRuntime` is a session-scoped lifecycle service for start, resume, pause,
+cancel, status, and idle-continuation flows. It is not a product `/goal`
+command parser and does not choose providers, hosted queues, socket services,
+or UI state. Products can compose it directly for advanced control, or attach
+it through `RaygentGoalRuntimeOptions` when constructing SDK sessions.
 
 Conversation and loop:
 

@@ -13,7 +13,7 @@ import contextlib
 import inspect
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import InitVar, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
@@ -34,6 +34,7 @@ from raygent_harness.core.permissions import (
 from raygent_harness.core.query_engine import QueryEngine, SDKMessage, SDKResult
 from raygent_harness.core.task import AppStateStore
 from raygent_harness.core.tool import QueryTracking, Tool, ToolUseContext
+from raygent_harness.goals import GoalRuntime, GoalRuntimeConfig, GoalStore
 from raygent_harness.sdk.profiles import (
     RaygentOverlay,
     RaygentPreset,
@@ -124,6 +125,20 @@ class RaygentRunCallbacks:
 
 
 @dataclass(frozen=True)
+class RaygentGoalRuntimeOptions:
+    """Explicit opt-in goal runtime attachment for factory-created sessions.
+
+    Passing this group asks the SDK factory to attach Raygent's existing
+    session-scoped `GoalRuntime` as a runtime handle. It does not start,
+    resume, continue, or parse product `/goal` commands by itself.
+    """
+
+    store: GoalStore | None = None
+    config: GoalRuntimeConfig = field(default_factory=GoalRuntimeConfig)
+    install_on_create: bool = False
+
+
+@dataclass(frozen=True)
 class RaygentKernelEventCallbackSink:
     """Kernel event sink that forwards events to a callback."""
 
@@ -175,6 +190,7 @@ class RaygentRuntimeHandles:
     transcript_scope: TranscriptScope | None
     observability: KernelEventBus
     abort_event: asyncio.Event
+    goal_runtime: GoalRuntime | None = None
 
     @property
     def transcript_path(self) -> str | None:
@@ -399,6 +415,7 @@ class RaygentFactoryConfig:
     preset: RaygentPreset | str | None = None
     overlays: tuple[RaygentOverlay | str, ...] = ()
     preset_options: RaygentPresetOptions | None = None
+    goal_runtime_options: RaygentGoalRuntimeOptions | None = None
 
 
 @dataclass
@@ -415,9 +432,17 @@ class RaygentSession:
     deps: QueryDeps
     ctx: ToolUseContext
     _handles: RaygentRuntimeHandles | None = field(default=None, repr=False)
+    goal_runtime_options: InitVar[RaygentGoalRuntimeOptions | None] = None
     _active_turn: bool = field(default=False, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
     _memory_extractions_drained: bool = field(default=True, init=False, repr=False)
+
+    def __post_init__(
+        self,
+        goal_runtime_options: RaygentGoalRuntimeOptions | None,
+    ) -> None:
+        if goal_runtime_options is not None:
+            self._attach_goal_runtime(goal_runtime_options)
 
     async def __aenter__(self) -> RaygentSession:
         return self
@@ -479,6 +504,19 @@ class RaygentSession:
     @property
     def is_closed(self) -> bool:
         return self._closed
+
+    def _attach_goal_runtime(self, options: RaygentGoalRuntimeOptions) -> None:
+        if options.store is None:
+            goal_runtime = GoalRuntime(self, config=options.config)
+        else:
+            goal_runtime = GoalRuntime(
+                self,
+                store=options.store,
+                config=options.config,
+            )
+        if options.install_on_create:
+            goal_runtime.install()
+        self._handles = replace(self.handles, goal_runtime=goal_runtime)
 
     def abort(self) -> None:
         """Signal cooperative cancellation for the current/future turn."""
@@ -653,6 +691,7 @@ class _ResolvedFactorySettings:
     remote_agent_persistence_store: RemoteAgentPersistenceStore | None
     agent_route_record_store: AgentRouteRecordStore | None
     experiments: dict[str, bool]
+    goal_runtime_options: RaygentGoalRuntimeOptions | None
 
 
 @dataclass(frozen=True)
@@ -780,13 +819,15 @@ class RaygentFactory:
             observability=observability_bus,
             abort_event=ctx.abort_event,
         )
-        return RaygentSession(
+        session = RaygentSession(
             engine=engine,
             config=query_config,
             deps=deps,
             ctx=ctx,
             _handles=handles,
+            goal_runtime_options=settings.goal_runtime_options,
         )
+        return session
 
 
 def create_raygent(
@@ -803,6 +844,7 @@ def create_raygent(
     persistence_options: RaygentPersistenceOptions | None = None,
     agent_options: RaygentAgentOptions | None = None,
     observability_options: RaygentObservabilityOptions | None = None,
+    goal_runtime_options: RaygentGoalRuntimeOptions | None = None,
     preset: RaygentPreset | str | None = None,
     overlays: tuple[RaygentOverlay | str, ...] = (),
     preset_options: RaygentPresetOptions | None = None,
@@ -843,6 +885,7 @@ def create_raygent(
         persistence_options=persistence_options,
         agent_options=agent_options,
         observability_options=observability_options,
+        goal_runtime_options=goal_runtime_options,
         preset=preset,
         overlays=overlays,
         preset_options=preset_options,
@@ -885,6 +928,7 @@ def _coerce_factory_config(
     persistence_options: RaygentPersistenceOptions | None,
     agent_options: RaygentAgentOptions | None,
     observability_options: RaygentObservabilityOptions | None,
+    goal_runtime_options: RaygentGoalRuntimeOptions | None,
     preset: RaygentPreset | str | None,
     overlays: tuple[RaygentOverlay | str, ...],
     preset_options: RaygentPresetOptions | None,
@@ -923,6 +967,7 @@ def _coerce_factory_config(
             persistence_options=persistence_options,
             agent_options=agent_options,
             observability_options=observability_options,
+            goal_runtime_options=goal_runtime_options,
             preset=preset,
             overlays=overlays,
             preset_options=preset_options,
@@ -973,6 +1018,7 @@ def _coerce_factory_config(
         persistence_options=persistence_options,
         agent_options=agent_options,
         observability_options=observability_options,
+        goal_runtime_options=goal_runtime_options,
         preset=preset,
         overlays=overlays,
         preset_options=preset_options,
@@ -1362,6 +1408,7 @@ def _resolve_factory_settings(config: RaygentFactoryConfig) -> _ResolvedFactoryS
             if model_options is not None and model_options.experiments is not None
             else {}
         ),
+        goal_runtime_options=config.goal_runtime_options,
     )
 
 
@@ -1398,6 +1445,7 @@ def _config_override_names(
     persistence_options: RaygentPersistenceOptions | None,
     agent_options: RaygentAgentOptions | None,
     observability_options: RaygentObservabilityOptions | None,
+    goal_runtime_options: RaygentGoalRuntimeOptions | None,
     preset: RaygentPreset | str | None,
     overlays: tuple[RaygentOverlay | str, ...],
     preset_options: RaygentPresetOptions | None,
@@ -1446,6 +1494,8 @@ def _config_override_names(
         names.append("agent_options")
     if observability_options is not None:
         names.append("observability_options")
+    if goal_runtime_options is not None:
+        names.append("goal_runtime_options")
     if preset is not None:
         names.append("preset")
     if overlays:
@@ -1752,6 +1802,7 @@ __all__ = [
     "RaygentContextSelection",
     "RaygentFactory",
     "RaygentFactoryConfig",
+    "RaygentGoalRuntimeOptions",
     "RaygentKernelEventCallback",
     "RaygentKernelEventCallbackSink",
     "RaygentMemoryOptions",

@@ -18,6 +18,7 @@ ROOT = Path(__file__).parents[2]
         ("examples/project_profile.py", "Project profile is ready"),
         ("examples/reusable_factory.py", "factory session: user-alice"),
         ("examples/sdk_callbacks.py", "kernel events: query.turn.started"),
+        ("examples/goal_runtime_service.py", "status: complete"),
     ),
 )
 def test_documented_examples_run(example: str, expected: str) -> None:

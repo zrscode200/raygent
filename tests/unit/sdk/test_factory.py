@@ -56,6 +56,13 @@ from raygent_harness.core.tool_hooks import (
     PostToolUseHook,
     PreToolUseHook,
 )
+from raygent_harness.goals import (
+    GET_GOAL_TOOL_NAME,
+    UPDATE_GOAL_TOOL_NAME,
+    GoalRuntime,
+    GoalRuntimeConfig,
+    InMemoryGoalStore,
+)
 from raygent_harness.sdk import (
     RaygentAgentOptions,
     RaygentCallbackHandle,
@@ -64,6 +71,7 @@ from raygent_harness.sdk import (
     RaygentContextSelection,
     RaygentFactory,
     RaygentFactoryConfig,
+    RaygentGoalRuntimeOptions,
     RaygentKernelEventCallbackSink,
     RaygentMemoryOptions,
     RaygentModelOptions,
@@ -200,6 +208,7 @@ def test_create_raygent_without_preset_keeps_safe_defaults(tmp_path: Path) -> No
     assert session.deps.context_providers == ()
     assert session.transcript_store is None
     assert session.deps.memory_prompt_provider is None
+    assert session.handles.goal_runtime is None
 
 
 def test_chat_preset_adds_transcript_store_under_cwd(tmp_path: Path) -> None:
@@ -877,11 +886,81 @@ def test_runtime_handles_expose_session_owned_services(tmp_path: Path) -> None:
     assert handles.transcript_path == transcript_store.path_for(transcript_scope)
     assert handles.observability is session.observability
     assert handles.abort_event is session.abort_event
+    assert handles.goal_runtime is None
     assert session.output_dir == handles.output_dir
     assert session.task_output_store is handles.task_output_store
     assert session.transcript_store is transcript_store
     assert session.transcript_scope == handles.transcript_scope
     assert session.transcript_path == handles.transcript_path
+
+
+def test_goal_runtime_options_attach_runtime_without_installing_by_default(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryGoalStore()
+    runtime_config = GoalRuntimeConfig()
+
+    session = create_raygent(
+        provider=_provider(),
+        model="demo-model",
+        cwd=tmp_path,
+        session_id="goal-sdk-session",
+        goal_runtime_options=RaygentGoalRuntimeOptions(
+            store=store,
+            config=runtime_config,
+        ),
+    )
+
+    goal_runtime = session.handles.goal_runtime
+
+    assert isinstance(goal_runtime, GoalRuntime)
+    assert goal_runtime.session is session
+    assert goal_runtime.store is store
+    assert goal_runtime.config is runtime_config
+    assert session.config.tools == ()
+    assert session.ctx.tools == ()
+    assert session.deps.context_providers == ()
+    assert session.deps.tool_catalog_provider is None
+
+
+@pytest.mark.asyncio
+async def test_goal_runtime_options_can_install_on_create(tmp_path: Path) -> None:
+    store = InMemoryGoalStore()
+
+    session = create_raygent(
+        provider=_provider(),
+        model="demo-model",
+        cwd=tmp_path,
+        goal_runtime_options=RaygentGoalRuntimeOptions(
+            store=store,
+            install_on_create=True,
+        ),
+    )
+
+    goal_runtime = session.handles.goal_runtime
+
+    assert isinstance(goal_runtime, GoalRuntime)
+    assert goal_runtime.store is store
+    assert any(
+        context_provider_kind(provider_obj) == "goal"
+        for provider_obj in session.deps.context_providers
+    )
+    assert set(await _turn_tools(session)) == {
+        GET_GOAL_TOOL_NAME,
+        UPDATE_GOAL_TOOL_NAME,
+    }
+
+
+def test_goals_overlay_alone_does_not_attach_goal_runtime(tmp_path: Path) -> None:
+    session = create_raygent(
+        provider=_provider(),
+        model="demo-model",
+        cwd=tmp_path,
+        preset="long_running_task",
+        overlays=("goals",),
+    )
+
+    assert session.handles.goal_runtime is None
 
 
 @pytest.mark.asyncio
@@ -1731,6 +1810,9 @@ def test_create_raygent_rejects_ambiguous_config_and_missing_required_args(
 
     with pytest.raises(ValueError, match="session_id"):
         create_raygent(config, session_id="ignored")
+
+    with pytest.raises(ValueError, match="goal_runtime_options"):
+        create_raygent(config, goal_runtime_options=RaygentGoalRuntimeOptions())
 
     with pytest.raises(ValueError, match="requires provider and model"):
         create_raygent()
