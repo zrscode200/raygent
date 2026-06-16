@@ -1,10 +1,26 @@
 """Runtime identity and provenance descriptor contracts.
 
 This service package exposes data-only references and descriptors for
-Raygent-owned runtime objects. Builder and snapshot helpers live in later
-SDK-RUNTIME waves; this package starts with the stable descriptor substrate.
+Raygent-owned runtime objects plus pure builders over already-supplied Raygent
+runtime facts. Snapshot helpers live in later SDK-RUNTIME waves.
 """
 
+from raygent_harness.services.runtime_identity.builders import (
+    RuntimeHandlesLike,
+    describe_goal_artifact,
+    describe_goal_runtime,
+    describe_goal_state,
+    describe_kernel_event,
+    describe_runtime_handles,
+    describe_runtime_recovery_result,
+    describe_task_output_read_result,
+    describe_task_output_reference,
+    describe_task_state,
+    describe_transcript_entry,
+    describe_transcript_scope,
+    describe_transcript_search_match,
+    runtime_object_ref,
+)
 from raygent_harness.services.runtime_identity.models import (
     DEFAULT_MAX_RUNTIME_DESCRIPTOR_METADATA_CHARS,
     RUNTIME_IDENTITY_SCHEMA_VERSION,
@@ -47,6 +63,7 @@ __all__ = (
     "GoalRuntimeDescriptor",
     "RecoveryDescriptor",
     "RuntimeDescriptor",
+    "RuntimeHandlesLike",
     "RuntimeIdentityValidationError",
     "RuntimeLifecycleCategory",
     "RuntimeLifecycleDescriptor",
@@ -60,11 +77,24 @@ __all__ = (
     "TaskDescriptor",
     "TaskOutputDescriptor",
     "TranscriptEntryDescriptor",
+    "describe_goal_artifact",
+    "describe_goal_runtime",
+    "describe_goal_state",
+    "describe_kernel_event",
+    "describe_runtime_handles",
+    "describe_runtime_recovery_result",
+    "describe_task_output_read_result",
+    "describe_task_output_reference",
+    "describe_task_state",
+    "describe_transcript_entry",
+    "describe_transcript_scope",
+    "describe_transcript_search_match",
     "runtime_lifecycle_category_for",
     "runtime_lifecycle_descriptor_from_dict",
     "runtime_lifecycle_descriptor_to_dict",
     "runtime_object_descriptor_from_dict",
     "runtime_object_descriptor_to_dict",
+    "runtime_object_ref",
     "runtime_object_reference_from_dict",
     "runtime_object_reference_to_dict",
     "runtime_provenance_from_dict",

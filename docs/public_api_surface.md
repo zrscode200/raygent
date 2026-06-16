@@ -386,6 +386,7 @@ Runtime identity and provenance:
   - `RuntimeLifecycleCategory`
   - `RuntimePathDisclosure`
   - `RuntimeObjectDescriptorType`
+  - `RuntimeHandlesLike`
   - `RuntimeIdentityValidationError`
   - `RuntimeObjectReference`
   - `RuntimeProvenance`
@@ -401,6 +402,19 @@ Runtime identity and provenance:
   - `RecoveryDescriptor`
   - `EventDescriptor`
   - `RuntimeDescriptor`
+  - `runtime_object_ref(...)`
+  - `describe_runtime_handles(...)`
+  - `describe_transcript_scope(...)`
+  - `describe_transcript_entry(...)`
+  - `describe_transcript_search_match(...)`
+  - `describe_task_state(...)`
+  - `describe_task_output_reference(...)`
+  - `describe_task_output_read_result(...)`
+  - `describe_kernel_event(...)`
+  - `describe_goal_runtime(...)`
+  - `describe_goal_state(...)`
+  - `describe_goal_artifact(...)`
+  - `describe_runtime_recovery_result(...)`
   - `runtime_lifecycle_category_for(...)`
   - `runtime_object_reference_to_dict(...)`
   - `runtime_object_reference_from_dict(...)`
@@ -421,6 +435,16 @@ future explicit local-debug/path-disclosure option and are never authority.
 `tool_use` is identifier-only provenance until Raygent owns a standalone
 tool-call object. `GoalRuntimeDescriptor` exposes only public/safe attachment,
 config, store, and explicitly supplied active-goal facts.
+
+The builder helpers in `raygent_harness.services.runtime_identity` are pure
+adapters over already-supplied Raygent facts. They do not scan transcript or
+task-output stores, replay transcripts, read task-output bodies, invoke tools
+or providers, mutate runtime state, start or resume goals, construct hidden
+goal runtimes, add SDK factory options, or implement product catalog/search/UI
+behavior. Default builders preserve ids, native statuses, bounded counts, and
+presence flags while keeping raw local paths, transcript snippets, task-output
+bytes, event payloads, goal objectives, artifact URI text, and product-owned
+labels/ranking data out of descriptor metadata.
 
 Bounded improvement proposals and gates:
 
