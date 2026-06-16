@@ -165,14 +165,14 @@ def describe_runtime_session(
             max_descriptors=resolved_options.max_descriptors,
             warnings=warnings,
         ) or truncated
-        if resolved_options.include_active_goal and active_goal is not None:
-            truncated = _append_descriptor(
-                descriptors,
-                describe_goal_state(active_goal),
-                seen_refs,
-                max_descriptors=resolved_options.max_descriptors,
-                warnings=warnings,
-            ) or truncated
+    if resolved_options.include_active_goal and active_goal is not None:
+        truncated = _append_descriptor(
+            descriptors,
+            describe_goal_state(active_goal),
+            seen_refs,
+            max_descriptors=resolved_options.max_descriptors,
+            warnings=warnings,
+        ) or truncated
 
     supplied_groups: tuple[tuple[str, Sequence[object]], ...] = (
         ("transcript_entries", transcript_entries),

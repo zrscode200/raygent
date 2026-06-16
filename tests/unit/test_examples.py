@@ -19,6 +19,7 @@ ROOT = Path(__file__).parents[2]
         ("examples/reusable_factory.py", "factory session: user-alice"),
         ("examples/sdk_callbacks.py", "kernel events: query.turn.started"),
         ("examples/goal_runtime_service.py", "status: complete"),
+        ("examples/runtime_identity_snapshot.py", "runtime identity snapshot:"),
     ),
 )
 def test_documented_examples_run(example: str, expected: str) -> None:

@@ -160,7 +160,56 @@ See:
 - `examples/project_profile.py`: conservative project profile.
 - `examples/reusable_factory.py`: reusable factory and product-wrapper pattern.
 - `examples/sdk_callbacks.py`: callback and kernel-event handling.
+- `examples/runtime_identity_snapshot.py`: runtime identity descriptors over
+  supplied handles.
 - `recipes/create_raygent/`: copyable preset construction recipes.
+
+## Runtime Identity Snapshots
+
+Applications that build catalogs, inspectors, recovery views, or operator
+consoles can use Raygent's runtime identity descriptors as kernel facts. The
+descriptor layer lives under `raygent_harness.services.runtime_identity` and is
+separate from the SDK factory: it describes existing sessions, tasks,
+transcript scopes, goal facts, task-output metadata, recovery summaries, and
+events that the caller already has.
+
+Use `describe_runtime_session(...)` when a product surface needs a bounded
+snapshot of one supplied `RaygentSession` or `RaygentRuntimeHandles` object:
+
+```python
+from raygent_harness.services.runtime_identity import (
+    RuntimeIdentitySnapshotOptions,
+    describe_runtime_session,
+    runtime_object_descriptor_to_dict,
+)
+
+snapshot = describe_runtime_session(
+    session,
+    options=RuntimeIdentitySnapshotOptions(max_tasks=25),
+)
+descriptors = [
+    runtime_object_descriptor_to_dict(descriptor)
+    for descriptor in snapshot.descriptors
+]
+```
+
+The snapshot helper returns descriptor records and warnings only. It does not
+replay transcripts, scan transcript stores, read task-output bodies, replay
+observability history, install or resume goals, construct hidden goal runtimes,
+invoke tools/providers, add `create_raygent(...)` options, or create product
+catalog state.
+
+Product layers should persist, rank, label, filter, and render descriptors in
+their own stores. Raygent owns the kernel facts: source ids, object references,
+source-supplied provenance, native lifecycle status, coarse lifecycle category,
+bounded counts, and path/content presence flags. Default descriptors avoid raw
+local paths, transcript snippets, task-output bytes, event payloads, goal
+objectives, artifact URI text, product labels, thumbnails, and search-ranking
+metadata.
+
+See `examples/runtime_identity_snapshot.py` for an offline example that builds
+SDK runtime handles, adds an in-memory task, and prints descriptor kinds
+without running a model provider or product UI.
 
 ## Low-Level Runtime Pieces
 

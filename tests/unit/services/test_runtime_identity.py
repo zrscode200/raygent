@@ -762,6 +762,47 @@ def test_runtime_identity_snapshot_includes_only_supplied_bounded_facts() -> Non
     assert "/tmp/transcript.jsonl" not in serialized
 
 
+def test_runtime_identity_snapshot_active_goal_flag_is_independent() -> None:
+    active_goal = create_goal_state(
+        goal_id="goal-1",
+        session_id="session-1",
+        spec=GoalSpec(objective="secret objective"),
+        now=5.0,
+    )
+    handles = cast(
+        RuntimeHandlesLike,
+        SimpleNamespace(
+            session_id="session-1",
+            cwd="/tmp/raygent-project",
+            task_store=SimpleNamespace(tasks={}),
+            output_dir=Path("/tmp/raygent-output"),
+            task_output_store=object(),
+            transcript_store=None,
+            transcript_scope=None,
+            observability=object(),
+            abort_event=object(),
+            goal_runtime=None,
+        ),
+    )
+
+    snapshot = describe_runtime_session(
+        handles,
+        active_goal=active_goal,
+        options=RuntimeIdentitySnapshotOptions(
+            include_goal_runtime=False,
+            include_active_goal=True,
+        ),
+    )
+    serialized = json.dumps(
+        [runtime_object_descriptor_to_dict(item) for item in snapshot.descriptors],
+        sort_keys=True,
+    )
+
+    assert any(item.ref.kind == "goal" for item in snapshot.descriptors)
+    assert not any(item.ref.kind == "goal_runtime" for item in snapshot.descriptors)
+    assert "secret objective" not in serialized
+
+
 def test_runtime_identity_snapshot_enforces_descriptor_and_supplied_item_bounds() -> None:
     handles = cast(
         RuntimeHandlesLike,

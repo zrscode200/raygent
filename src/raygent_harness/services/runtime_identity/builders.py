@@ -47,16 +47,35 @@ from raygent_harness.services.transcript.search import TranscriptSearchMatch
 class RuntimeHandlesLike(Protocol):
     """Minimal session handle shape consumed by runtime identity builders."""
 
-    session_id: str
-    cwd: str
-    task_store: object
-    output_dir: object
-    task_output_store: object
-    transcript_store: object | None
-    transcript_scope: TranscriptScope | None
-    observability: object
-    abort_event: object
-    goal_runtime: GoalRuntime | None
+    @property
+    def session_id(self) -> str: ...
+
+    @property
+    def cwd(self) -> str: ...
+
+    @property
+    def task_store(self) -> object: ...
+
+    @property
+    def output_dir(self) -> object: ...
+
+    @property
+    def task_output_store(self) -> object: ...
+
+    @property
+    def transcript_store(self) -> object | None: ...
+
+    @property
+    def transcript_scope(self) -> TranscriptScope | None: ...
+
+    @property
+    def observability(self) -> object: ...
+
+    @property
+    def abort_event(self) -> object: ...
+
+    @property
+    def goal_runtime(self) -> GoalRuntime | None: ...
 
 
 def runtime_object_ref(
