@@ -2,7 +2,7 @@
 
 This service package exposes data-only references and descriptors for
 Raygent-owned runtime objects plus pure builders over already-supplied Raygent
-runtime facts. Snapshot helpers live in later SDK-RUNTIME waves.
+runtime facts and bounded one-session snapshots.
 """
 
 from raygent_harness.services.runtime_identity.builders import (
@@ -53,6 +53,12 @@ from raygent_harness.services.runtime_identity.models import (
     runtime_provenance_from_dict,
     runtime_provenance_to_dict,
 )
+from raygent_harness.services.runtime_identity.snapshot import (
+    RuntimeIdentitySessionLike,
+    RuntimeIdentitySnapshot,
+    RuntimeIdentitySnapshotOptions,
+    describe_runtime_session,
+)
 
 __all__ = (
     "DEFAULT_MAX_RUNTIME_DESCRIPTOR_METADATA_CHARS",
@@ -64,6 +70,9 @@ __all__ = (
     "RecoveryDescriptor",
     "RuntimeDescriptor",
     "RuntimeHandlesLike",
+    "RuntimeIdentitySessionLike",
+    "RuntimeIdentitySnapshot",
+    "RuntimeIdentitySnapshotOptions",
     "RuntimeIdentityValidationError",
     "RuntimeLifecycleCategory",
     "RuntimeLifecycleDescriptor",
@@ -83,6 +92,7 @@ __all__ = (
     "describe_kernel_event",
     "describe_runtime_handles",
     "describe_runtime_recovery_result",
+    "describe_runtime_session",
     "describe_task_output_read_result",
     "describe_task_output_reference",
     "describe_task_state",

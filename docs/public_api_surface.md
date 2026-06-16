@@ -387,6 +387,9 @@ Runtime identity and provenance:
   - `RuntimePathDisclosure`
   - `RuntimeObjectDescriptorType`
   - `RuntimeHandlesLike`
+  - `RuntimeIdentitySessionLike`
+  - `RuntimeIdentitySnapshot`
+  - `RuntimeIdentitySnapshotOptions`
   - `RuntimeIdentityValidationError`
   - `RuntimeObjectReference`
   - `RuntimeProvenance`
@@ -415,6 +418,7 @@ Runtime identity and provenance:
   - `describe_goal_state(...)`
   - `describe_goal_artifact(...)`
   - `describe_runtime_recovery_result(...)`
+  - `describe_runtime_session(...)`
   - `runtime_lifecycle_category_for(...)`
   - `runtime_object_reference_to_dict(...)`
   - `runtime_object_reference_from_dict(...)`
@@ -445,6 +449,17 @@ behavior. Default builders preserve ids, native statuses, bounded counts, and
 presence flags while keeping raw local paths, transcript snippets, task-output
 bytes, event payloads, goal objectives, artifact URI text, and product-owned
 labels/ranking data out of descriptor metadata.
+
+`describe_runtime_session(...)` produces a bounded one-session descriptor
+snapshot from an existing session-like object or runtime handles. It uses
+explicit include flags and count bounds, describes current task-store entries
+that are already present in memory, and can fold in caller-supplied bounded
+facts such as transcript search matches, task-output read metadata, kernel
+events, goal state/artifacts, or recovery summaries. It returns descriptors
+and warnings only: no transcript replay, store scan, task-output body read,
+observability history replay, goal lifecycle action, hidden goal-runtime
+construction, SDK factory option, product catalog/search/UI behavior, or
+product `/goal` behavior is performed.
 
 Bounded improvement proposals and gates:
 

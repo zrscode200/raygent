@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from raygent_harness.services.runtime_identity import (
     ArtifactDescriptor,
     GoalRuntimeDescriptor,
     RuntimeHandlesLike,
+    RuntimeIdentitySnapshotOptions,
     RuntimeIdentityValidationError,
     RuntimeLifecycleDescriptor,
     RuntimeObjectReference,
@@ -30,6 +32,7 @@ from raygent_harness.services.runtime_identity import (
     describe_kernel_event,
     describe_runtime_handles,
     describe_runtime_recovery_result,
+    describe_runtime_session,
     describe_task_output_read_result,
     describe_task_output_reference,
     describe_task_state,
@@ -605,6 +608,370 @@ def test_builder_runtime_recovery_result_avoids_paths() -> None:
     assert descriptor.restored_agent_name_count == 1
     assert descriptor.restored_remote_task_count == 1
     assert "/tmp/transcript.jsonl" not in serialized
+
+
+def test_runtime_identity_snapshot_from_session_like_is_bounded_and_path_safe() -> None:
+    first_task = TaskStateBase(
+        id="task-1",
+        type="local_bash",
+        description="first task",
+        status="running",
+        start_time=1.0,
+        output_file="/tmp/task-1.output",
+    )
+    second_task = TaskStateBase(
+        id="task-2",
+        type="local_agent",
+        description="second task",
+        status="pending",
+        start_time=2.0,
+        output_file="/tmp/task-2.output",
+    )
+    handles = cast(
+        RuntimeHandlesLike,
+        SimpleNamespace(
+            session_id="session-1",
+            cwd="/tmp/raygent-project",
+            task_store=SimpleNamespace(
+                tasks={
+                    "task-1": first_task,
+                    "task-2": second_task,
+                }
+            ),
+            output_dir=Path("/tmp/raygent-output"),
+            task_output_store=object(),
+            transcript_store=object(),
+            transcript_scope=TranscriptScope(
+                session_id="session-1",
+                runtime_session_id="runtime-1",
+                agent_id="agent-1",
+                is_sidechain=True,
+            ),
+            observability=object(),
+            abort_event=object(),
+            goal_runtime=None,
+        ),
+    )
+    session_like = SimpleNamespace(handles=handles)
+
+    snapshot = describe_runtime_session(
+        cast(Any, session_like),
+        options=RuntimeIdentitySnapshotOptions(max_tasks=1),
+    )
+    serialized = json.dumps(
+        [runtime_object_descriptor_to_dict(item) for item in snapshot.descriptors],
+        sort_keys=True,
+    )
+
+    assert snapshot.session_id == "session-1"
+    assert snapshot.truncated is True
+    assert "tasks_truncated" in snapshot.warnings
+    assert any(item.ref.kind == "session" for item in snapshot.descriptors)
+    assert any(item.ref.kind == "runtime_session" for item in snapshot.descriptors)
+    assert any(item.ref.kind == "agent" for item in snapshot.descriptors)
+    assert sum(1 for item in snapshot.descriptors if item.ref.kind == "task") == 1
+    assert "/tmp/raygent-project" not in serialized
+    assert "/tmp/raygent-output" not in serialized
+    assert "/tmp/task-1.output" not in serialized
+    assert "/tmp/task-2.output" not in serialized
+
+
+def test_runtime_identity_snapshot_includes_only_supplied_bounded_facts() -> None:
+    artifact = GoalArtifact(
+        artifact_id="artifact-1",
+        kind="task_output",
+        uri="file:///tmp/secret-artifact.txt",
+        description="secret artifact description",
+    )
+    active_goal = replace(
+        create_goal_state(
+            goal_id="goal-1",
+            session_id="session-1",
+            spec=GoalSpec(objective="secret objective"),
+            now=5.0,
+        ),
+        artifacts=(artifact,),
+    )
+    handles = cast(
+        RuntimeHandlesLike,
+        SimpleNamespace(
+            session_id="session-1",
+            cwd="/tmp/raygent-project",
+            task_store=SimpleNamespace(tasks={}),
+            output_dir=Path("/tmp/raygent-output"),
+            task_output_store=object(),
+            transcript_store=None,
+            transcript_scope=None,
+            observability=object(),
+            abort_event=object(),
+            goal_runtime=None,
+        ),
+    )
+    match = TranscriptSearchMatch(
+        session_id="session-1",
+        entry_id="tr-1",
+        role="assistant",
+        snippet="secret snippet",
+        score=10,
+        order=2,
+        created_at=7.0,
+        source_path="/tmp/transcript.jsonl",
+    )
+    read_result = TaskOutputReadResult(
+        task_id="task-1",
+        content=b"secret output bytes",
+        start_offset=0,
+        bytes_read=19,
+        bytes_total=19,
+        next_offset=19,
+    )
+    event = KernelEvent(
+        id="event-1",
+        type="task.completed",
+        sequence=1,
+        created_at=8.0,
+        source="task",
+        session_id="session-1",
+        data={"secret": "event payload"},
+    )
+
+    snapshot = describe_runtime_session(
+        handles,
+        active_goal=active_goal,
+        transcript_search_matches=(match,),
+        task_output_read_results=(read_result,),
+        kernel_events=(event,),
+        goal_artifacts=(artifact,),
+        options=RuntimeIdentitySnapshotOptions(max_supplied_items=1),
+    )
+    serialized = json.dumps(
+        [runtime_object_descriptor_to_dict(item) for item in snapshot.descriptors],
+        sort_keys=True,
+    )
+
+    assert snapshot.truncated is False
+    assert any(item.ref.kind == "goal" for item in snapshot.descriptors)
+    assert any(item.ref.kind == "artifact" for item in snapshot.descriptors)
+    assert any(item.ref.kind == "task_output" for item in snapshot.descriptors)
+    assert any(item.ref.kind == "event" for item in snapshot.descriptors)
+    assert "secret objective" not in serialized
+    assert "secret snippet" not in serialized
+    assert "secret output bytes" not in serialized
+    assert "event payload" not in serialized
+    assert "file:///tmp/secret-artifact.txt" not in serialized
+    assert "/tmp/transcript.jsonl" not in serialized
+
+
+def test_runtime_identity_snapshot_enforces_descriptor_and_supplied_item_bounds() -> None:
+    handles = cast(
+        RuntimeHandlesLike,
+        SimpleNamespace(
+            session_id="session-1",
+            cwd="/tmp/raygent-project",
+            task_store=SimpleNamespace(tasks={}),
+            output_dir=Path("/tmp/raygent-output"),
+            task_output_store=object(),
+            transcript_store=None,
+            transcript_scope=None,
+            observability=object(),
+            abort_event=object(),
+            goal_runtime=None,
+        ),
+    )
+    matches = tuple(
+        TranscriptSearchMatch(
+            session_id="session-1",
+            entry_id=f"tr-{index}",
+            role="user",
+            snippet=f"snippet-{index}",
+            score=index,
+            order=index,
+            created_at=float(index),
+        )
+        for index in range(3)
+    )
+
+    snapshot = describe_runtime_session(
+        handles,
+        transcript_search_matches=matches,
+        options=RuntimeIdentitySnapshotOptions(
+            include_goal_runtime=False,
+            max_supplied_items=1,
+            max_descriptors=1,
+        ),
+    )
+
+    assert snapshot.truncated is True
+    assert snapshot.warnings == ("transcript_search_matches_truncated", "descriptors_truncated")
+    assert len(snapshot.descriptors) == 1
+    with pytest.raises(RuntimeIdentityValidationError):
+        RuntimeIdentitySnapshotOptions(max_tasks=-1)
+    with pytest.raises(RuntimeIdentityValidationError):
+        RuntimeIdentitySnapshotOptions(max_descriptors=0)
+
+
+def test_runtime_identity_snapshot_rejects_cross_session_supplied_facts() -> None:
+    handles = cast(
+        RuntimeHandlesLike,
+        SimpleNamespace(
+            session_id="session-1",
+            cwd="/tmp/raygent-project",
+            task_store=SimpleNamespace(tasks={}),
+            output_dir=Path("/tmp/raygent-output"),
+            task_output_store=object(),
+            transcript_store=object(),
+            transcript_scope=TranscriptScope(session_id="session-2"),
+            observability=object(),
+            abort_event=object(),
+            goal_runtime=None,
+        ),
+    )
+
+    with pytest.raises(RuntimeIdentityValidationError):
+        describe_runtime_session(handles)
+
+    handles = cast(
+        RuntimeHandlesLike,
+        SimpleNamespace(
+            session_id="session-1",
+            cwd="/tmp/raygent-project",
+            task_store=SimpleNamespace(tasks={}),
+            output_dir=Path("/tmp/raygent-output"),
+            task_output_store=object(),
+            transcript_store=None,
+            transcript_scope=None,
+            observability=object(),
+            abort_event=object(),
+            goal_runtime=None,
+        ),
+    )
+    other_goal = create_goal_state(
+        goal_id="goal-2",
+        session_id="session-2",
+        spec=GoalSpec(objective="other objective"),
+    )
+    other_entry = TranscriptMessageEntry(
+        session_id="session-2",
+        message={"role": "user", "content": "other session body"},
+    )
+    other_match = TranscriptSearchMatch(
+        session_id="session-2",
+        entry_id="tr-other",
+        role="user",
+        snippet="other session snippet",
+        score=1,
+        order=1,
+        created_at=1.0,
+    )
+    other_event = KernelEvent(
+        id="event-other",
+        type="task.completed",
+        sequence=1,
+        created_at=1.0,
+        source="task",
+        session_id="session-2",
+    )
+    other_recovery = RuntimeRecoveryResult(
+        replay=SessionReplay(session_id="session-2", messages=[]),
+        transcript_scope=TranscriptScope(session_id="session-2"),
+        transcript_path=None,
+        last_message_entry_id=None,
+    )
+
+    with pytest.raises(RuntimeIdentityValidationError):
+        describe_runtime_session(handles, active_goal=other_goal)
+    with pytest.raises(RuntimeIdentityValidationError):
+        describe_runtime_session(handles, transcript_entries=(other_entry,))
+    with pytest.raises(RuntimeIdentityValidationError):
+        describe_runtime_session(handles, transcript_search_matches=(other_match,))
+    with pytest.raises(RuntimeIdentityValidationError):
+        describe_runtime_session(handles, kernel_events=(other_event,))
+    with pytest.raises(RuntimeIdentityValidationError):
+        describe_runtime_session(handles, runtime_recovery_results=(other_recovery,))
+    with pytest.raises(RuntimeIdentityValidationError):
+        describe_runtime_session(
+            handles,
+            goal_artifacts=(GoalArtifact(artifact_id="artifact-1", kind="task_output"),),
+        )
+
+
+def test_runtime_identity_snapshot_task_bounds_do_not_walk_entire_store() -> None:
+    class _CountingTaskMapping(dict[str, TaskStateBase]):
+        iterated = 0
+
+        def values(self) -> Iterator[TaskStateBase]:  # type: ignore[override]
+            for value in super().values():
+                self.iterated += 1
+                yield value
+
+    tasks = _CountingTaskMapping(
+        {
+            f"task-{index}": TaskStateBase(
+                id=f"task-{index}",
+                type="local_bash",
+                description=f"task {index}",
+                status="running",
+                start_time=float(index),
+            )
+            for index in range(10)
+        }
+    )
+    handles = cast(
+        RuntimeHandlesLike,
+        SimpleNamespace(
+            session_id="session-1",
+            cwd="/tmp/raygent-project",
+            task_store=SimpleNamespace(tasks=tasks),
+            output_dir=Path("/tmp/raygent-output"),
+            task_output_store=object(),
+            transcript_store=None,
+            transcript_scope=None,
+            observability=object(),
+            abort_event=object(),
+            goal_runtime=None,
+        ),
+    )
+
+    snapshot = describe_runtime_session(
+        handles,
+        options=RuntimeIdentitySnapshotOptions(max_tasks=2),
+    )
+
+    assert tasks.iterated == 3
+    assert snapshot.truncated is True
+    assert "tasks_truncated" in snapshot.warnings
+    assert sum(1 for item in snapshot.descriptors if item.ref.kind == "task") == 2
+
+
+def test_runtime_identity_snapshot_keeps_bounded_no_read_boundary() -> None:
+    source = (
+        Path(__file__).parents[3]
+        / "src"
+        / "raygent_harness"
+        / "services"
+        / "runtime_identity"
+        / "snapshot.py"
+    ).read_text()
+
+    banned_calls = (
+        ".read_entries(",
+        ".read_result(",
+        ".read_tail(",
+        ".read_range(",
+        ".size(",
+        ".get_active_for_session(",
+        ".list_for_session(",
+        ".install(",
+        ".start(",
+        ".resume(",
+        ".cancel(",
+        "run_until_result(",
+        "subprocess",
+        "urllib",
+        "requests",
+    )
+    for banned in banned_calls:
+        assert banned not in source
 
 
 def test_runtime_identity_builders_keep_pure_adapter_boundary() -> None:

@@ -262,14 +262,19 @@ def describe_transcript_search_match(
     )
 
 
-def describe_task_state(task: TaskStateBase) -> TaskDescriptor:
+def describe_task_state(
+    task: TaskStateBase,
+    *,
+    session_id: str | None = None,
+) -> TaskDescriptor:
     """Describe task state without exposing output paths or output content."""
 
     agent_id = _optional_string_attr(task, "agent_id")
     parent_agent_id = _optional_string_attr(task, "parent_agent_id")
     return TaskDescriptor(
-        ref=runtime_object_ref("task", task.id, agent_id=agent_id),
+        ref=runtime_object_ref("task", task.id, session_id=session_id, agent_id=agent_id),
         provenance=_provenance_from_ids(
+            session_id=session_id,
             agent_id=agent_id,
             parent_agent_id=parent_agent_id,
             tool_use_id=task.tool_use_id,
@@ -299,12 +304,19 @@ def describe_task_state(task: TaskStateBase) -> TaskDescriptor:
 
 def describe_task_output_reference(
     reference: TaskOutputReference,
+    *,
+    session_id: str | None = None,
 ) -> TaskOutputDescriptor:
     """Describe a task-output reference without exposing its concrete path."""
 
     return TaskOutputDescriptor(
-        ref=runtime_object_ref("task_output", reference.task_id),
+        ref=runtime_object_ref(
+            "task_output",
+            reference.task_id,
+            session_id=session_id,
+        ),
         provenance=_provenance_from_ids(
+            session_id=session_id,
             task_id=reference.task_id,
             source="task_output_reference",
         ),
@@ -318,12 +330,14 @@ def describe_task_output_read_result(
     *,
     store_kind: str = "bounded_read",
     path_present: bool = False,
+    session_id: str | None = None,
 ) -> TaskOutputDescriptor:
     """Describe bounded task-output read metadata without storing bytes."""
 
     return TaskOutputDescriptor(
-        ref=runtime_object_ref("task_output", result.task_id),
+        ref=runtime_object_ref("task_output", result.task_id, session_id=session_id),
         provenance=_provenance_from_ids(
+            session_id=session_id,
             task_id=result.task_id,
             source="task_output_read_result",
         ),
