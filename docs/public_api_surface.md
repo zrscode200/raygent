@@ -375,6 +375,53 @@ Transcript and output storage:
   - `TranscriptSearchService`
 - `raygent_harness.services.task_output`
 
+Runtime identity and provenance:
+
+- `raygent_harness.services.runtime_identity`
+  - data-only runtime object references, provenance, lifecycle, and descriptor
+    contracts for Raygent-owned runtime facts
+  - `RUNTIME_IDENTITY_SCHEMA_VERSION`
+  - `DEFAULT_MAX_RUNTIME_DESCRIPTOR_METADATA_CHARS`
+  - `RuntimeObjectKind`
+  - `RuntimeLifecycleCategory`
+  - `RuntimePathDisclosure`
+  - `RuntimeObjectDescriptorType`
+  - `RuntimeIdentityValidationError`
+  - `RuntimeObjectReference`
+  - `RuntimeProvenance`
+  - `RuntimeLifecycleDescriptor`
+  - `RuntimeObjectDescriptor`
+  - `SessionDescriptor`
+  - `TranscriptEntryDescriptor`
+  - `TaskDescriptor`
+  - `TaskOutputDescriptor`
+  - `GoalRuntimeDescriptor`
+  - `GoalDescriptor`
+  - `ArtifactDescriptor`
+  - `RecoveryDescriptor`
+  - `EventDescriptor`
+  - `RuntimeDescriptor`
+  - `runtime_lifecycle_category_for(...)`
+  - `runtime_object_reference_to_dict(...)`
+  - `runtime_object_reference_from_dict(...)`
+  - `runtime_provenance_to_dict(...)`
+  - `runtime_provenance_from_dict(...)`
+  - `runtime_lifecycle_descriptor_to_dict(...)`
+  - `runtime_lifecycle_descriptor_from_dict(...)`
+  - `runtime_object_descriptor_to_dict(...)`
+  - `runtime_object_descriptor_from_dict(...)`
+
+`raygent_harness.services.runtime_identity` is a kernel descriptor substrate,
+not a product catalog or UI index. It preserves native ids and statuses,
+records provenance only when supplied by the source object, and uses a coarse
+lifecycle category only for safe cross-object grouping. Default descriptors use
+presence flags for local paths such as cwd, transcript path, output dir,
+task-output path, worktree path, and artifact URI; raw local paths require a
+future explicit local-debug/path-disclosure option and are never authority.
+`tool_use` is identifier-only provenance until Raygent owns a standalone
+tool-call object. `GoalRuntimeDescriptor` exposes only public/safe attachment,
+config, store, and explicitly supplied active-goal facts.
+
 Bounded improvement proposals and gates:
 
 - `raygent_harness.improvement`
