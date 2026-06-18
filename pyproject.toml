@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Production agent harness focused on long-session capability"
 readme = "README.md"
 authors = [{ email = "raysu1128@gmail.com" }]
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.9.0",
