@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -222,6 +222,117 @@ SDKMessage = (
 )
 
 
+@dataclass(frozen=True)
+class SDKStreamOptions:
+    """Opt-in public stream callback controls.
+
+    These options govern display-safe SDK stream events only. They do not
+    enable raw provider payloads, tool input/result bodies, hidden reasoning,
+    or other internal query events.
+    """
+
+    text_deltas: bool = True
+    reasoning_available: bool = True
+    tool_lifecycle: bool = True
+    max_text_delta_chars: int = 4096
+    max_tool_preview_chars: int = 512
+
+    def __post_init__(self) -> None:
+        if self.max_text_delta_chars < 1:
+            raise ValueError("max_text_delta_chars must be at least 1")
+        if self.max_tool_preview_chars < 0:
+            raise ValueError("max_tool_preview_chars must be non-negative")
+
+
+@dataclass(frozen=True)
+class SDKMessageDelta:
+    """Display-safe assistant text delta for opted-in SDK stream callbacks."""
+
+    type: Literal["message.delta"] = "message.delta"
+    session_id: str = ""
+    turn_id: str | None = None
+    iteration: int | None = None
+    stream_id: str = ""
+    text: str = ""
+    index: int | None = None
+    is_final: bool | None = None
+
+
+@dataclass(frozen=True)
+class SDKReasoningAvailable:
+    """Reasoning-availability marker without hidden reasoning content."""
+
+    type: Literal["reasoning.available"] = "reasoning.available"
+    session_id: str = ""
+    turn_id: str | None = None
+    iteration: int | None = None
+    stream_id: str = ""
+    available: bool = True
+    char_count: int | None = None
+    token_count: int | None = None
+
+
+@dataclass(frozen=True)
+class SDKToolStart:
+    """Display-safe tool lifecycle start event."""
+
+    type: Literal["tool.start"] = "tool.start"
+    session_id: str = ""
+    turn_id: str | None = None
+    iteration: int | None = None
+    tool_use_id: str = ""
+    tool_name: str = ""
+    started_at_s: float | None = None
+
+
+@dataclass(frozen=True)
+class SDKToolProgress:
+    """Display-safe tool progress event with bounded public message text."""
+
+    type: Literal["tool.progress"] = "tool.progress"
+    session_id: str = ""
+    turn_id: str | None = None
+    iteration: int | None = None
+    tool_use_id: str = ""
+    tool_name: str = ""
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class SDKToolComplete:
+    """Display-safe tool lifecycle completion event."""
+
+    type: Literal["tool.complete"] = "tool.complete"
+    session_id: str = ""
+    turn_id: str | None = None
+    iteration: int | None = None
+    tool_use_id: str = ""
+    tool_name: str = ""
+    status: Literal[
+        "completed",
+        "failed",
+        "denied",
+        "aborted",
+        "interrupted",
+        "validation_error",
+        "unknown_tool",
+        "error",
+    ] = "completed"
+    duration_s: float | None = None
+    summary: str = ""
+    error_type: str | None = None
+
+
+SDKStreamEvent = (
+    SDKMessageDelta
+    | SDKReasoningAvailable
+    | SDKToolStart
+    | SDKToolProgress
+    | SDKToolComplete
+)
+SDKStreamEventCallback = Callable[[SDKStreamEvent], object]
+
+
 # ---------------------------------------------------------------------------
 # QueryEngine — the conversation container.
 # ---------------------------------------------------------------------------
@@ -369,6 +480,9 @@ class QueryEngine:
     async def submit_message(
         self,
         prompt: str | MessageParam,
+        *,
+        stream_callback: SDKStreamEventCallback | None = None,
+        stream_options: SDKStreamOptions | None = None,
     ) -> AsyncGenerator[SDKMessage, None]:
         """Run one turn. Yields SDK messages; ends with a terminal SDKResult.
 
@@ -381,6 +495,12 @@ class QueryEngine:
              `SDKMessage`, appending assistant/user messages to our log.
           7. On generator completion, inspect `Terminal` and emit `SDKResult`.
         """
+        if stream_callback is not None and stream_options is None:
+            stream_options = SDKStreamOptions()
+        # SDK-STREAM-001A only threads the opt-in sink through the public
+        # boundary. Event mapping is added in later waves.
+        _ = stream_callback, stream_options
+
         self._turn_index += 1
         event_context = self._observability_context(
             turn_id=f"turn-{self._turn_index}",
@@ -2144,8 +2264,16 @@ __all__ = [
     "SDKAssistantMessage",
     "SDKCompactBoundary",
     "SDKMessage",
+    "SDKMessageDelta",
+    "SDKReasoningAvailable",
     "SDKResult",
     "SDKResultSubtype",
+    "SDKStreamEvent",
+    "SDKStreamEventCallback",
+    "SDKStreamOptions",
     "SDKSystemInit",
+    "SDKToolComplete",
+    "SDKToolProgress",
+    "SDKToolStart",
     "SDKUserMessage",
 ]

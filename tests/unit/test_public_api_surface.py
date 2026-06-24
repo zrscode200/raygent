@@ -42,6 +42,7 @@ DOCUMENTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "RaygentSDKMessageCallback",
         "RaygentSDKProtocolError",
         "RaygentSDKResultCallback",
+        "RaygentSDKStreamEventCallback",
         "RaygentSession",
         "RaygentSessionBusyError",
         "RaygentSessionClosedError",
@@ -51,6 +52,13 @@ DOCUMENTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "RaygentToolProfile",
         "RaygentToolProfileOptions",
         "RaygentToolSelection",
+        "SDKMessageDelta",
+        "SDKReasoningAvailable",
+        "SDKStreamEvent",
+        "SDKStreamOptions",
+        "SDKToolComplete",
+        "SDKToolProgress",
+        "SDKToolStart",
         "create_raygent",
         "describe_raygent_preset",
         "list_raygent_presets",
@@ -74,6 +82,14 @@ DOCUMENTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "SDKUserMessage",
         "SDKCompactBoundary",
         "SDKResult",
+        "SDKMessageDelta",
+        "SDKReasoningAvailable",
+        "SDKStreamEvent",
+        "SDKStreamEventCallback",
+        "SDKStreamOptions",
+        "SDKToolComplete",
+        "SDKToolProgress",
+        "SDKToolStart",
     ),
     "raygent_harness.core.config": (
         "QueryConfig",
@@ -635,6 +651,41 @@ def test_sdk_all_matches_documented_contract() -> None:
     exported = cast(tuple[str, ...], module.__all__)
 
     assert set(exported) == set(DOCUMENTED_SYMBOLS["raygent_harness.sdk"])
+
+
+def test_sdk_stream_event_contracts_do_not_expose_raw_payload_fields() -> None:
+    from raygent_harness.core.query_engine import (
+        SDKMessageDelta,
+        SDKReasoningAvailable,
+        SDKToolComplete,
+        SDKToolProgress,
+        SDKToolStart,
+    )
+
+    forbidden_fields = {
+        "additional_messages",
+        "args",
+        "content",
+        "data",
+        "input",
+        "payload",
+        "provider_metadata",
+        "raw_path",
+        "result_body",
+        "signature",
+        "thinking",
+        "tool_input",
+        "tool_result",
+    }
+
+    for event_type in (
+        SDKMessageDelta,
+        SDKReasoningAvailable,
+        SDKToolStart,
+        SDKToolProgress,
+        SDKToolComplete,
+    ):
+        assert forbidden_fields.isdisjoint(event_type.__dataclass_fields__)
 
 
 def test_public_api_doc_describes_preset_precedence_contract() -> None:

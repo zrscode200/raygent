@@ -49,8 +49,16 @@ Embedding factory:
   - `RaygentSDKMessageCallback`
   - `RaygentSDKProtocolError`
   - `RaygentSDKResultCallback`
+  - `RaygentSDKStreamEventCallback`
   - `RaygentSessionBusyError`
   - `RaygentSessionClosedError`
+  - `SDKMessageDelta`
+  - `SDKReasoningAvailable`
+  - `SDKStreamEvent`
+  - `SDKStreamOptions`
+  - `SDKToolComplete`
+  - `SDKToolProgress`
+  - `SDKToolStart`
   - `RaygentToolProfile`
   - `RaygentToolProfileOptions`
   - `RaygentToolSelection`
@@ -174,7 +182,8 @@ separate runtime loop:
 
 - `run(...)` / `submit_message(...)`: yield existing `QueryEngine` SDK messages.
   Both accept optional `RaygentRunCallbacks` for adapter-side `on_message`,
-  `on_result`, and run-scoped `on_kernel_event` hooks.
+  `on_result`, opt-in `on_stream_event`, and run-scoped `on_kernel_event`
+  hooks.
 - `run_until_result(...)`: consume one turn and return the terminal `SDKResult`.
 - `add_kernel_event_callback(...)`: attach a persistent callback to the
   session's existing `KernelEventBus`, returning a detachable
@@ -196,16 +205,30 @@ Callback helpers are adapter conveniences, not a product event schema:
 - SDK messages remain the primary run stream.
 - `RaygentRunCallbacks.on_message` sees every yielded `SDKMessage`;
   `on_result` sees only terminal `SDKResult` messages.
+- `RaygentRunCallbacks.on_stream_event` is opt-in and receives only public
+  `SDKStreamEvent` values: `SDKMessageDelta`, `SDKReasoningAvailable`,
+  `SDKToolStart`, `SDKToolProgress`, or `SDKToolComplete`.
+- `SDKStreamOptions` controls whether text deltas, reasoning availability, and
+  tool lifecycle events are eligible for callback delivery and bounds public
+  text/preview sizes.
 - `on_message` and `on_result` exceptions intentionally propagate to the caller
   and close the wrapped kernel stream before the session becomes available for
   another turn.
+- `on_stream_event` exceptions follow the same cleanup path as message/result
+  callback failures: the wrapped kernel stream is closed, run-scoped kernel
+  callbacks are detached, and the session becomes available for a later run.
 - `on_kernel_event` uses the existing session event bus for the duration of one
   run and is detached when the run generator closes.
 - `RaygentKernelEventCallbackSink` is synchronous because `KernelEventBus`
   sinks are synchronous. Sink failures are captured by the bus and never mutate
   query/tool/task semantics.
+- Stream callbacks are display-safe by default: no raw provider payloads,
+  hidden reasoning or chain-of-thought, thinking signatures, tool input bodies,
+  tool result bodies, raw local paths, or secrets are part of the public stream
+  contract.
 - There is no global event bus, late-attachment backlog, product telemetry
-  dashboard, raw-content telemetry default, or product-specific mutation hook.
+  dashboard, raw-content telemetry default, product event schema ownership, or
+  product-specific mutation hook.
 
 Low-level SDK tool/context profiles remain explicit and conservative:
 
@@ -256,6 +279,14 @@ Conversation and loop:
   - `SDKUserMessage`
   - `SDKCompactBoundary`
   - `SDKResult`
+  - `SDKMessageDelta`
+  - `SDKReasoningAvailable`
+  - `SDKStreamEvent`
+  - `SDKStreamEventCallback`
+  - `SDKStreamOptions`
+  - `SDKToolComplete`
+  - `SDKToolProgress`
+  - `SDKToolStart`
 - `raygent_harness.core.config`
   - `QueryConfig`
   - `SamplingParams`

@@ -31,7 +31,19 @@ from raygent_harness.core.permissions import (
     ToolPermissionContext,
     empty_tool_permission_context,
 )
-from raygent_harness.core.query_engine import QueryEngine, SDKMessage, SDKResult
+from raygent_harness.core.query_engine import (
+    QueryEngine,
+    SDKMessage,
+    SDKMessageDelta,
+    SDKReasoningAvailable,
+    SDKResult,
+    SDKStreamEvent,
+    SDKStreamEventCallback,
+    SDKStreamOptions,
+    SDKToolComplete,
+    SDKToolProgress,
+    SDKToolStart,
+)
 from raygent_harness.core.task import AppStateStore
 from raygent_harness.core.tool import QueryTracking, Tool, ToolUseContext
 from raygent_harness.goals import GoalRuntime, GoalRuntimeConfig, GoalStore
@@ -91,7 +103,9 @@ RaygentToolSelection = RaygentToolProfile | Sequence[Tool]
 RaygentContextSelection = RaygentContextProfile | Sequence[ContextProvider]
 RaygentSDKMessageCallback = Callable[[SDKMessage], object]
 RaygentSDKResultCallback = Callable[[SDKResult], object]
+RaygentSDKStreamEventCallback = SDKStreamEventCallback
 RaygentKernelEventCallback = Callable[[KernelEvent], None]
+
 
 class RaygentSDKError(Exception):
     """Base exception for the embedding factory/session layer."""
@@ -117,11 +131,14 @@ class RaygentRunCallbacks:
     `SDKResult`. `on_result` receives only terminal `SDKResult` messages.
     `on_kernel_event` is attached to the session's existing `KernelEventBus`
     for the duration of the run and is removed when the run generator closes.
+    `on_stream_event` receives opted-in display-safe stream events.
     """
 
     on_message: RaygentSDKMessageCallback | None = None
     on_result: RaygentSDKResultCallback | None = None
     on_kernel_event: RaygentKernelEventCallback | None = None
+    on_stream_event: RaygentSDKStreamEventCallback | None = None
+    stream_options: SDKStreamOptions = field(default_factory=SDKStreamOptions)
 
 
 @dataclass(frozen=True)
@@ -600,9 +617,15 @@ class RaygentSession:
         if callbacks is not None and callbacks.on_kernel_event is not None:
             callback_handle = self.add_kernel_event_callback(callbacks.on_kernel_event)
         try:
-            async with contextlib.aclosing(
-                self.engine.submit_message(prompt)
-            ) as engine_stream:
+            if callbacks is not None and callbacks.on_stream_event is not None:
+                engine_messages = self.engine.submit_message(
+                    prompt,
+                    stream_callback=callbacks.on_stream_event,
+                    stream_options=callbacks.stream_options,
+                )
+            else:
+                engine_messages = self.engine.submit_message(prompt)
+            async with contextlib.aclosing(engine_messages) as engine_stream:
                 async for event in engine_stream:
                     await _invoke_run_callbacks(callbacks, event)
                     yield event
@@ -1822,6 +1845,7 @@ __all__ = [
     "RaygentSDKMessageCallback",
     "RaygentSDKProtocolError",
     "RaygentSDKResultCallback",
+    "RaygentSDKStreamEventCallback",
     "RaygentSession",
     "RaygentSessionBusyError",
     "RaygentSessionClosedError",
@@ -1831,6 +1855,13 @@ __all__ = [
     "RaygentToolProfile",
     "RaygentToolProfileOptions",
     "RaygentToolSelection",
+    "SDKMessageDelta",
+    "SDKReasoningAvailable",
+    "SDKStreamEvent",
+    "SDKStreamOptions",
+    "SDKToolComplete",
+    "SDKToolProgress",
+    "SDKToolStart",
     "create_raygent",
     "describe_raygent_preset",
     "list_raygent_presets",

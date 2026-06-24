@@ -27,7 +27,11 @@ from raygent_harness.core.deps import (
     ToolPermissionEngine,
 )
 from raygent_harness.core.messages import assistant_message
-from raygent_harness.core.observability import KernelEvent, KernelEventContext
+from raygent_harness.core.observability import (
+    KernelEvent,
+    KernelEventBus,
+    KernelEventContext,
+)
 from raygent_harness.core.permission_engine import PermissionRequest
 from raygent_harness.core.permissions import (
     PermissionAllowDecision,
@@ -38,7 +42,11 @@ from raygent_harness.core.query_engine import (
     QueryEngine,
     SDKAssistantMessage,
     SDKMessage,
+    SDKMessageDelta,
     SDKResult,
+    SDKStreamEvent,
+    SDKStreamEventCallback,
+    SDKStreamOptions,
     SDKSystemInit,
 )
 from raygent_harness.core.task import AppStateStore, TaskStateBase
@@ -418,9 +426,14 @@ def _manual_session_with_engine(
     tmp_path: Path,
     *,
     session_id: str,
+    observability: KernelEventBus | None = None,
 ) -> RaygentSession:
     config = QueryConfig(model="demo-model", session_id=session_id)
-    deps = QueryDeps(task_store=AppStateStore(), model_provider=_provider())
+    deps = QueryDeps(
+        task_store=AppStateStore(),
+        model_provider=_provider(),
+        observability=observability if observability is not None else KernelEventBus(),
+    )
     ctx = ToolUseContext(
         session_id=session_id,
         agent_id=None,
@@ -443,6 +456,80 @@ class _FinalizingEngine:
         self.finalized_prompts: list[str] = []
 
     async def submit_message(self, prompt: str) -> AsyncIterator[SDKMessage]:
+        try:
+            yield SDKSystemInit(session_id=self.session_id, model="demo-model")
+            yield SDKResult(session_id=self.session_id, result=f"{prompt}: result")
+        finally:
+            self.finalized_prompts.append(prompt)
+
+    async def drain_memory_extractions(
+        self,
+        timeout_s: float | None = 60.0,
+    ) -> bool:
+        _ = timeout_s
+        return True
+
+
+class _StreamCallbackEngine:
+    def __init__(self, *, session_id: str = "stream-callback-session") -> None:
+        self.session_id = session_id
+        self.finalized_prompts: list[str] = []
+        self.stream_callback_seen: list[bool] = []
+        self.stream_options_seen: list[SDKStreamOptions | None] = []
+
+    async def submit_message(
+        self,
+        prompt: str,
+        *,
+        stream_callback: SDKStreamEventCallback | None = None,
+        stream_options: SDKStreamOptions | None = None,
+    ) -> AsyncIterator[SDKMessage]:
+        self.stream_callback_seen.append(stream_callback is not None)
+        self.stream_options_seen.append(stream_options)
+        try:
+            yield SDKSystemInit(session_id=self.session_id, model="demo-model")
+            if stream_callback is not None:
+                stream_callback(
+                    SDKMessageDelta(
+                        session_id=self.session_id,
+                        stream_id=f"{prompt}-stream",
+                        text=f"{prompt}: delta",
+                    )
+                )
+            yield SDKResult(session_id=self.session_id, result=f"{prompt}: result")
+        finally:
+            self.finalized_prompts.append(prompt)
+
+    async def drain_memory_extractions(
+        self,
+        timeout_s: float | None = 60.0,
+    ) -> bool:
+        _ = timeout_s
+        return True
+
+
+class _StreamSetupFailingEngine:
+    def __init__(self, *, session_id: str = "stream-setup-failure-session") -> None:
+        self.session_id = session_id
+        self.prompts: list[str] = []
+        self.finalized_prompts: list[str] = []
+        self.fail_next_submit: bool = True
+
+    def submit_message(
+        self,
+        prompt: str,
+        *,
+        stream_callback: SDKStreamEventCallback | None = None,
+        stream_options: SDKStreamOptions | None = None,
+    ) -> AsyncIterator[SDKMessage]:
+        _ = stream_callback, stream_options
+        self.prompts.append(prompt)
+        if self.fail_next_submit:
+            self.fail_next_submit = False
+            raise RuntimeError("engine setup failed")
+        return self._stream(prompt)
+
+    async def _stream(self, prompt: str) -> AsyncIterator[SDKMessage]:
         try:
             yield SDKSystemInit(session_id=self.session_id, model="demo-model")
             yield SDKResult(session_id=self.session_id, result=f"{prompt}: result")
@@ -1204,6 +1291,26 @@ async def test_run_callbacks_receive_messages_and_terminal_result(
 
 
 @pytest.mark.asyncio
+async def test_run_callbacks_preserve_positional_kernel_callback_compatibility(
+    tmp_path: Path,
+) -> None:
+    session = create_raygent(
+        provider=_provider(),
+        model="demo-model",
+        cwd=tmp_path,
+        session_id="positional-kernel-callback-session",
+    )
+    kernel_events: list[KernelEvent] = []
+
+    await session.run_until_result(
+        "Use positional callbacks.",
+        callbacks=RaygentRunCallbacks(None, None, kernel_events.append),
+    )
+
+    assert any(event.type == "query.turn.started" for event in kernel_events)
+
+
+@pytest.mark.asyncio
 async def test_run_callback_exception_closes_inner_engine_stream(
     tmp_path: Path,
 ) -> None:
@@ -1229,6 +1336,137 @@ async def test_run_callback_exception_closes_inner_engine_stream(
 
     assert result.result == "Second: result"
     assert engine.finalized_prompts == ["First", "Second"]
+
+
+@pytest.mark.asyncio
+async def test_run_stream_callback_is_opt_in_and_passes_options(
+    tmp_path: Path,
+) -> None:
+    engine = _StreamCallbackEngine(session_id="stream-callback-session")
+    session = _manual_session_with_engine(
+        engine,
+        tmp_path,
+        session_id="stream-callback-session",
+    )
+    stream_events: list[SDKMessageDelta] = []
+
+    def on_stream_event(event: SDKStreamEvent) -> None:
+        assert isinstance(event, SDKMessageDelta)
+        stream_events.append(event)
+
+    result = await session.run_until_result(
+        "No stream",
+        callbacks=RaygentRunCallbacks(on_message=lambda _event: None),
+    )
+
+    assert result.result == "No stream: result"
+    assert stream_events == []
+    assert engine.stream_callback_seen == [False]
+    assert engine.stream_options_seen == [None]
+
+    options = SDKStreamOptions(
+        text_deltas=False,
+        reasoning_available=False,
+        max_text_delta_chars=32,
+        max_tool_preview_chars=8,
+    )
+
+    result = await session.run_until_result(
+        "With stream",
+        callbacks=RaygentRunCallbacks(
+            on_stream_event=on_stream_event,
+            stream_options=options,
+        ),
+    )
+
+    assert result.result == "With stream: result"
+    assert stream_events == [
+        SDKMessageDelta(
+            session_id="stream-callback-session",
+            stream_id="With stream-stream",
+            text="With stream: delta",
+        )
+    ]
+    assert engine.stream_callback_seen == [False, True]
+    assert engine.stream_options_seen == [None, options]
+
+
+@pytest.mark.asyncio
+async def test_run_stream_callback_exception_closes_stream_and_detaches_kernel(
+    tmp_path: Path,
+) -> None:
+    engine = _StreamCallbackEngine(session_id="stream-callback-exception-session")
+    session = _manual_session_with_engine(
+        engine,
+        tmp_path,
+        session_id="stream-callback-exception-session",
+    )
+    kernel_events: list[KernelEvent] = []
+
+    def broken_stream_callback(_event: SDKStreamEvent) -> None:
+        raise RuntimeError("stream callback failed")
+
+    with pytest.raises(RuntimeError, match="stream callback failed"):
+        await session.run_until_result(
+            "First",
+            callbacks=RaygentRunCallbacks(
+                on_stream_event=broken_stream_callback,
+                on_kernel_event=kernel_events.append,
+            ),
+        )
+
+    assert engine.finalized_prompts == ["First"]
+    seen_after_failure = len(kernel_events)
+
+    session.observability.emit(
+        "sdk.after_stream_callback_failure",
+        context=KernelEventContext(session_id=session.session_id),
+    )
+
+    assert len(kernel_events) == seen_after_failure
+
+    result = await session.run_until_result("Second")
+
+    assert result.result == "Second: result"
+    assert engine.finalized_prompts == ["First", "Second"]
+
+
+@pytest.mark.asyncio
+async def test_run_stream_setup_failure_resets_session_and_detaches_kernel(
+    tmp_path: Path,
+) -> None:
+    engine = _StreamSetupFailingEngine(session_id="stream-setup-failure-session")
+    session = _manual_session_with_engine(
+        engine,
+        tmp_path,
+        session_id="stream-setup-failure-session",
+    )
+    kernel_events: list[KernelEvent] = []
+
+    with pytest.raises(RuntimeError, match="engine setup failed"):
+        await session.run_until_result(
+            "First",
+            callbacks=RaygentRunCallbacks(
+                on_kernel_event=kernel_events.append,
+                on_stream_event=lambda _event: None,
+            ),
+        )
+
+    assert engine.prompts == ["First"]
+    seen_after_failure = len(kernel_events)
+
+    session.observability.emit(
+        "sdk.after_stream_setup_failure",
+        context=KernelEventContext(session_id=session.session_id),
+    )
+
+    assert len(kernel_events) == seen_after_failure
+
+    result = await session.run_until_result("Second")
+
+    assert result.result == "Second: result"
+    assert engine.prompts == ["First", "Second"]
+    assert engine.finalized_prompts == ["Second"]
 
 
 @pytest.mark.asyncio
