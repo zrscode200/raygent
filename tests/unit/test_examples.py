@@ -18,6 +18,7 @@ ROOT = Path(__file__).parents[2]
         ("examples/project_profile.py", "Project profile is ready"),
         ("examples/reusable_factory.py", "factory session: user-alice"),
         ("examples/sdk_callbacks.py", "kernel events: query.turn.started"),
+        ("examples/sdk_stream_events.py", "tool complete: Lookup completed"),
         ("examples/goal_runtime_service.py", "status: complete"),
         ("examples/runtime_identity_snapshot.py", "runtime identity snapshot:"),
     ),

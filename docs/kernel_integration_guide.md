@@ -154,12 +154,38 @@ Low-level factory profiles are explicit:
 and `add_kernel_event_callback(...)` provide adapter hooks without replacing the
 SDK stream or adding a product event schema.
 
+Use `RaygentRunCallbacks.on_stream_event` when an embedder needs live
+display-safe events while still preserving the normal terminal SDK result:
+
+- `SDKMessageDelta` reports normalized text deltas only when the provider/model
+  path actually streams.
+- `SDKReasoningAvailable` reports availability/count facts only; hidden
+  reasoning text, chain-of-thought, thinking signatures, and generated
+  summaries from hidden reasoning are not exposed.
+- `SDKToolStart`, `SDKToolProgress`, and `SDKToolComplete` report tool
+  lifecycle facts with stable `tool_use_id`, sanitized `tool_name`, bounded
+  sanitized progress/summary text, normalized status, and safe error class
+  when available.
+- Stream events are default-off. Supplying only `on_message`, `on_result`, or
+  no callbacks keeps the existing completed-message behavior.
+- Transport fallback, provider error, model fallback, and abort paths keep
+  public tool lifecycle streams balanced without exposing stale tool-result
+  bodies.
+
+Raygent owns the provider-neutral SDK event contract. Product gateways and UIs
+should map those events into their own schemas downstream instead of importing
+private query events or expecting Raygent to emit product-specific event names.
+For Raygent TUI, the downstream follow-up is to map the SDK text, reasoning,
+and tool lifecycle events in `tui_gateway/rendering_events.py` and then flip
+the TUI gateway capability flags that advertise public SDK stream support.
+
 See:
 
 - `examples/minimal_query.py`: minimal factory session.
 - `examples/project_profile.py`: conservative project profile.
 - `examples/reusable_factory.py`: reusable factory and product-wrapper pattern.
 - `examples/sdk_callbacks.py`: callback and kernel-event handling.
+- `examples/sdk_stream_events.py`: opt-in text/tool lifecycle stream callbacks.
 - `examples/runtime_identity_snapshot.py`: runtime identity descriptors over
   supplied handles.
 - `recipes/create_raygent/`: copyable preset construction recipes.

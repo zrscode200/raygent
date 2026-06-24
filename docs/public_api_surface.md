@@ -211,6 +211,30 @@ Callback helpers are adapter conveniences, not a product event schema:
 - `SDKStreamOptions` controls whether text deltas, reasoning availability, and
   tool lifecycle events are eligible for callback delivery and bounds public
   text/preview sizes.
+- Stream callbacks are disabled unless `on_stream_event` is supplied. Existing
+  embedders that consume only yielded `SDKMessage` / `SDKResult` values keep
+  the same completed-message behavior.
+- `SDKMessageDelta` is derived only from normalized provider-independent
+  `text_delta` stream facts. It carries Raygent session/turn/stream
+  correlation ids, text, index, and finality when known; it does not expose
+  provider request ids, attempt ids, raw provider payloads, tool JSON, media
+  payloads, or unknown provider-specific delta shapes.
+- `SDKReasoningAvailable` is availability-only. It can report safe
+  char/token-count facts from thinking presence or `reasoning_tokens`, but it
+  does not expose hidden reasoning text, chain-of-thought, thinking
+  signatures, provider metadata, or generated summaries from hidden reasoning.
+- `SDKToolStart`, `SDKToolProgress`, and `SDKToolComplete` are lifecycle
+  display facts, not transcript/tool-result bodies. They carry a stable
+  `tool_use_id`, sanitized `tool_name`, bounded sanitized progress or summary
+  text, status, and safe error class when available.
+- Tool completion status is normalized as one of `completed`, `failed`,
+  `denied`, `aborted`, `interrupted`, `validation_error`, `unknown_tool`, or
+  `error`. Invalidated stream attempts such as transport fallback, provider
+  error, model fallback, and abort still emit a public complete event for every
+  public start while suppressing stale model-visible tool-result messages.
+- Tool progress `data`, tool input bodies, raw result bodies, raw exception
+  messages, raw local paths, high-confidence secrets, provider metadata, and
+  raw provider payloads are not part of the public SDK stream event contract.
 - `on_message` and `on_result` exceptions intentionally propagate to the caller
   and close the wrapped kernel stream before the session becomes available for
   another turn.
@@ -229,6 +253,14 @@ Callback helpers are adapter conveniences, not a product event schema:
 - There is no global event bus, late-attachment backlog, product telemetry
   dashboard, raw-content telemetry default, product event schema ownership, or
   product-specific mutation hook.
+- Product UIs such as Raygent TUI should map these public SDK events into their
+  own gateway/UI event schema downstream. Raygent does not expose private
+  query events or TUI-specific event names as public SDK contracts.
+- The Raygent TUI follow-up is downstream of this package: map
+  `SDKMessageDelta`, `SDKReasoningAvailable`, and SDK tool lifecycle events in
+  `tui_gateway/rendering_events.py`, then flip the TUI gateway capability flags
+  that advertise public SDK stream support. No TUI source files live in this
+  Raygent kernel repo.
 
 Low-level SDK tool/context profiles remain explicit and conservative:
 
@@ -248,8 +280,9 @@ shell behaviors remain explicit opt-ins through lower-level providers/options;
 the SDK factory does not install them silently.
 
 Copyable construction examples live outside the runtime package under
-`recipes/create_raygent/`. Runtime library behavior remains under
-`src/raygent_harness/`.
+`recipes/create_raygent/`. Runnable SDK embedding examples live under
+`examples/`, including `examples/sdk_stream_events.py` for opt-in public
+stream callbacks. Runtime library behavior remains under `src/raygent_harness/`.
 
 Goal runtime:
 

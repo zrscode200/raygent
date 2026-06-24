@@ -103,6 +103,7 @@ uv run python examples/minimal_query.py
 uv run python examples/project_profile.py
 uv run python examples/reusable_factory.py
 uv run python examples/sdk_callbacks.py
+uv run python examples/sdk_stream_events.py
 uv run python examples/with_tools_and_context.py
 ```
 
@@ -167,8 +168,9 @@ async def main(provider: ModelProvider) -> None:
 
 See `examples/minimal_query.py` for a complete runnable one-shot factory
 example, `examples/reusable_factory.py` for a reusable factory/product-wrapper
-pattern, and `examples/provider_runtime_bridge.py` for a transport-free provider
-adapter example.
+pattern, `examples/sdk_stream_events.py` for opt-in display-safe stream
+callbacks, and `examples/provider_runtime_bridge.py` for a transport-free
+provider adapter example.
 
 ## Provider Support
 

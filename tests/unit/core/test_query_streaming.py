@@ -1717,6 +1717,69 @@ async def test_provider_error_discards_accepted_streamed_tool_use() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_stream_exception_completes_started_public_tool() -> None:
+    old_tool_started = asyncio.Event()
+    release_old_tool = asyncio.Event()
+
+    async def call(
+        _input: BaseModel,
+        _ctx: ToolUseContext,
+    ) -> AsyncIterator[ToolCallEvent]:
+        old_tool_started.set()
+        await release_old_tool.wait()
+        yield ToolResult(content="old exception result")
+
+    class ExceptionAfterToolUse(SequencedStreamProvider):
+        def stream(self, request: Any) -> AsyncIterator[ModelStreamEvent]:
+            self.stream_requests.append(request)
+            return self._first_stream()
+
+        async def _first_stream(self) -> AsyncIterator[ModelStreamEvent]:
+            for event in _tool_use_stream_events(
+                tool_use_id="toolu_old",
+                message_id="stream_exception_orphan",
+                value=1,
+            ):
+                yield event
+            await asyncio.wait_for(old_tool_started.wait(), timeout=1.0)
+            raise RuntimeError("raw stream exception")
+
+    stream_events: list[SDKStreamEvent] = []
+    engine, events = await _run_engine(
+        ExceptionAfterToolUse(()),
+        config=_config(tools=(_example_tool(call),)),
+        stream_callback=stream_events.append,
+    )
+    release_old_tool.set()
+    await asyncio.sleep(0)
+
+    assert "old exception result" not in str(engine._messages)  # pyright: ignore[reportPrivateUsage]
+    tool_stream_events = [
+        event
+        for event in stream_events
+        if isinstance(event, SDKToolStart | SDKToolComplete)
+    ]
+    assert tool_stream_events == [
+        SDKToolStart(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_old",
+            tool_name="Example",
+        ),
+        SDKToolComplete(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_old",
+            tool_name="Example",
+            status="interrupted",
+            summary="interrupted",
+        ),
+    ]
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].subtype == "error_during_execution"
+
+
+@pytest.mark.asyncio
 async def test_abort_during_no_tool_stream_skips_stop_hooks() -> None:
     ctx = _ctx()
     stop_hook_called = False

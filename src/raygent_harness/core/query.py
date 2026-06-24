@@ -1361,7 +1361,11 @@ async def _call_model_streaming(
                 response = update.response
     except asyncio.CancelledError:
         if streaming_executor is not None:
-            streaming_executor.discard("streaming_cancelled")
+            async for tool_event in _discard_streaming_tool_lifecycle(
+                streaming_executor,
+                reason="streaming_cancelled",
+            ):
+                yield tool_event
         if not failed_emitted:
             _emit_observability(
                 deps,
@@ -1376,7 +1380,11 @@ async def _call_model_streaming(
         raise
     except Exception as exc:
         if streaming_executor is not None:
-            streaming_executor.discard("streaming_error")
+            async for tool_event in _discard_streaming_tool_lifecycle(
+                streaming_executor,
+                reason="streaming_error",
+            ):
+                yield tool_event
         if not failed_emitted:
             provider_error = deps.model_provider.classify_error(exc)
             if provider_error.model_fallback is not None:
