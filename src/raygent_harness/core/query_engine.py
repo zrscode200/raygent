@@ -34,6 +34,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import re
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -94,6 +95,12 @@ from raygent_harness.core.query import (
     TombstoneMessage as _QueryTombstone,
 )
 from raygent_harness.core.query import (
+    ToolLifecycleEvent as _QueryToolLifecycleEvent,
+)
+from raygent_harness.core.query import (
+    ToolProgressEvent as _QueryToolProgressEvent,
+)
+from raygent_harness.core.query import (
     ToolResultMessage as _QueryToolResultMessage,
 )
 from raygent_harness.core.state import (
@@ -102,6 +109,7 @@ from raygent_harness.core.state import (
     State,
     UsageTotals,
 )
+from raygent_harness.services.team_memory_sync.secret_scanner import redact_secrets
 from raygent_harness.services.transcript import (
     CompactBoundaryEntry,
     ContentReplacementEntry,
@@ -1452,6 +1460,44 @@ class QueryEngine:
                 )
             return None
 
+        if isinstance(event, _QueryToolLifecycleEvent):
+            if (
+                stream_callback is not None
+                and stream_options is not None
+                and stream_options.tool_lifecycle
+            ):
+                await self._emit_sdk_stream_event(
+                    _sdk_tool_lifecycle_event(
+                        event,
+                        session_id=self._config.session_id,
+                        turn_id=turn_id,
+                        options=stream_options,
+                    ),
+                    stream_callback,
+                )
+            return None
+
+        if isinstance(event, _QueryToolProgressEvent):
+            if (
+                stream_callback is not None
+                and stream_options is not None
+                and stream_options.tool_lifecycle
+            ):
+                await self._emit_sdk_stream_event(
+                    SDKToolProgress(
+                        session_id=self._config.session_id,
+                        turn_id=turn_id,
+                        tool_use_id=event.tool_use_id,
+                        tool_name=_sanitize_sdk_tool_label(event.tool_name),
+                        message=_sanitize_sdk_tool_text(
+                            event.message,
+                            max_chars=stream_options.max_tool_preview_chars,
+                        ),
+                    ),
+                    stream_callback,
+                )
+            return None
+
         if isinstance(event, _QueryCompactBoundary):
             await self._record_compact_boundary(event)
             return SDKCompactBoundary(
@@ -1480,12 +1526,19 @@ class QueryEngine:
             turn_id=turn_id,
             options=options,
         ):
-            try:
-                result = callback(stream_event)
-                if inspect.isawaitable(result):
-                    await cast(Awaitable[object], result)
-            except Exception as err:
-                raise _SDKStreamCallbackError(err) from err
+            await self._emit_sdk_stream_event(stream_event, callback)
+
+    async def _emit_sdk_stream_event(
+        self,
+        event: SDKStreamEvent,
+        callback: SDKStreamEventCallback,
+    ) -> None:
+        try:
+            result = callback(event)
+            if inspect.isawaitable(result):
+                await cast(Awaitable[object], result)
+        except Exception as err:
+            raise _SDKStreamCallbackError(err) from err
 
     # -----------------------------------------------------------------
     # Terminal construction
@@ -1936,6 +1989,34 @@ def _sdk_stream_events_from_model_stream_event(
     return tuple(events)
 
 
+def _sdk_tool_lifecycle_event(
+    event: _QueryToolLifecycleEvent,
+    *,
+    session_id: str,
+    turn_id: str | None,
+    options: SDKStreamOptions,
+) -> SDKToolStart | SDKToolComplete:
+    if event.phase == "start":
+        return SDKToolStart(
+            session_id=session_id,
+            turn_id=turn_id,
+            tool_use_id=event.tool_use_id,
+            tool_name=_sanitize_sdk_tool_label(event.tool_name),
+        )
+    return SDKToolComplete(
+        session_id=session_id,
+        turn_id=turn_id,
+        tool_use_id=event.tool_use_id,
+        tool_name=_sanitize_sdk_tool_label(event.tool_name),
+        status=event.status,
+        summary=_sanitize_sdk_tool_text(
+            event.summary,
+            max_chars=options.max_tool_preview_chars,
+        ),
+        error_type=event.error_type,
+    )
+
+
 def _sdk_reasoning_available_event(
     payload: Mapping[str, Any],
     *,
@@ -2015,6 +2096,41 @@ def _chunk_stream_text(text: str, *, max_chars: int) -> tuple[str, ...]:
     return tuple(
         text[index : index + max_chars] for index in range(0, len(text), max_chars)
     )
+
+
+_SDK_TOOL_LABEL_MAX_CHARS = 128
+_SDK_TOOL_LOCAL_PATH_PATTERN = re.compile(
+    r"(?<![\w:@])(?:file://)?(?:~|/(?:"
+    r"Users|private|tmp|var|home|Volumes|opt|etc|usr|bin|sbin|System|"
+    r"Library|Applications"
+    r")\b)(?:/[^\s'\"`<>]*)*"
+    r"|(?<![\w])(?:[A-Za-z]:\\|\\\\)[^\s'\"`<>]+"
+)
+
+
+def _sanitize_sdk_tool_label(text: str) -> str:
+    return _bound_sdk_tool_text(
+        _sanitize_sdk_tool_text_unbounded(text),
+        max_chars=_SDK_TOOL_LABEL_MAX_CHARS,
+    )
+
+
+def _sanitize_sdk_tool_text(text: str, *, max_chars: int) -> str:
+    return _bound_sdk_tool_text(
+        _sanitize_sdk_tool_text_unbounded(text),
+        max_chars=max_chars,
+    )
+
+
+def _sanitize_sdk_tool_text_unbounded(text: str) -> str:
+    text = redact_secrets(text)
+    return _SDK_TOOL_LOCAL_PATH_PATTERN.sub("[REDACTED_PATH]", text)
+
+
+def _bound_sdk_tool_text(text: str, *, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    return text[:max_chars]
 
 
 _AGENT_TRIGGER_TRUNCATION_MARKER = "\n[agent trigger guidance truncated]"

@@ -32,7 +32,11 @@ from raygent_harness.core.observability import (
     KernelEventBus,
     RecordingKernelEventSink,
 )
-from raygent_harness.core.permissions import ToolPermissionContext
+from raygent_harness.core.permissions import (
+    HookPermissionDecisionReason,
+    PermissionDenyDecision,
+    ToolPermissionContext,
+)
 from raygent_harness.core.query import (
     MemoryRecallMessage,
     StreamRequestStart,
@@ -50,6 +54,9 @@ from raygent_harness.core.query_engine import (
     SDKStreamEventCallback,
     SDKStreamOptions,
     SDKSystemInit,
+    SDKToolComplete,
+    SDKToolProgress,
+    SDKToolStart,
     SDKUserMessage,
 )
 from raygent_harness.core.state import State
@@ -62,6 +69,8 @@ from raygent_harness.core.tool import (
     ToolResult,
     ToolSpec,
     ToolUseContext,
+    ValidationError,
+    ValidationOk,
     build_tool,
 )
 from raygent_harness.core.tool_orchestration import TOOL_CANCEL_MESSAGE
@@ -113,6 +122,8 @@ class ExampleInput(BaseModel):
 def _example_tool(
     call: Any | None = None,
     *,
+    validate_input: Any | None = None,
+    check_permissions: Any | None = None,
     interrupt_behavior: Literal["cancel", "block"] = "block",
 ):
     async def default_call(
@@ -127,6 +138,8 @@ def _example_tool(
             description="Example tool",
             input_model=ExampleInput,
             call=call or default_call,
+            validate_input=validate_input,
+            check_permissions=check_permissions,
             is_read_only=True,
             is_concurrency_safe=True,
             interrupt_behavior=interrupt_behavior,
@@ -365,6 +378,7 @@ def _tool_use_stream_events(
     *,
     tool_use_id: str,
     message_id: str,
+    tool_name: str = "Example",
     value: int,
 ) -> tuple[ModelStreamEvent, ...]:
     return (
@@ -374,7 +388,7 @@ def _tool_use_stream_events(
         ),
         ModelStreamEvent.content_block_start(
             _identity(block_index=0, message_id=message_id),
-            block=ToolUseContentBlock(id=tool_use_id, name="Example", input={}),
+            block=ToolUseContentBlock(id=tool_use_id, name=tool_name, input={}),
         ),
         ModelStreamEvent.content_block_delta(
             _identity(block_index=0, message_id=message_id),
@@ -548,7 +562,7 @@ async def test_sdk_stream_callback_emits_reasoning_availability_without_content(
 
 @pytest.mark.asyncio
 async def test_sdk_stream_callback_suppresses_tool_input_json_deltas() -> None:
-    provider = FakeModelProvider(stream_events=_tool_use_stream())
+    provider = SequencedStreamProvider((_tool_use_stream(), _text_stream("done")))
     stream_events: list[SDKStreamEvent] = []
 
     _engine, events = await _run_engine(
@@ -557,10 +571,301 @@ async def test_sdk_stream_callback_suppresses_tool_input_json_deltas() -> None:
         stream_callback=stream_events.append,
     )
 
-    assert stream_events == []
     assert "partial_json" not in repr(stream_events)
     assert "value" not in repr(stream_events)
     assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "done"
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_emits_tool_lifecycle_without_raw_bodies() -> None:
+    async def call(
+        _input: BaseModel,
+        _ctx: ToolUseContext,
+    ) -> AsyncIterator[ToolCallEvent]:
+        yield ToolProgress(message="working", data={"secret": "progress-data"})
+        yield ToolResult(content="SECRET_RESULT_BODY")
+
+    provider = SequencedStreamProvider((_tool_use_stream(), _text_stream("done")))
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        config=_config(tools=(_example_tool(call=call),)),
+        stream_callback=stream_events.append,
+    )
+
+    tool_events = [
+        event
+        for event in stream_events
+        if isinstance(event, SDKToolStart | SDKToolProgress | SDKToolComplete)
+    ]
+    assert tool_events == [
+        SDKToolStart(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_1",
+            tool_name="Example",
+        ),
+        SDKToolProgress(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_1",
+            tool_name="Example",
+            message="working",
+        ),
+        SDKToolComplete(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_1",
+            tool_name="Example",
+            status="completed",
+            summary="completed",
+        ),
+    ]
+    assert "SECRET_RESULT_BODY" not in repr(tool_events)
+    assert "progress-data" not in repr(tool_events)
+    assert '"value": 1' not in repr(tool_events)
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "done"
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_sanitizes_tool_progress_text() -> None:
+    secret = "ghp_" + "a" * 36
+
+    async def call(
+        _input: BaseModel,
+        _ctx: ToolUseContext,
+    ) -> AsyncIterator[ToolCallEvent]:
+        yield ToolProgress(
+            message=f"reading /Users/ziruisu/private.txt token={secret}",
+        )
+        yield ToolResult(content="done")
+
+    provider = SequencedStreamProvider((_tool_use_stream(), _text_stream("done")))
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        config=_config(tools=(_example_tool(call=call),)),
+        stream_callback=stream_events.append,
+    )
+
+    progress = next(event for event in stream_events if isinstance(event, SDKToolProgress))
+    assert progress.message == "reading [REDACTED_PATH] token=[REDACTED]"
+    assert "/Users/ziruisu/private.txt" not in repr(stream_events)
+    assert secret not in repr(stream_events)
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "done"
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_sanitizes_model_produced_tool_names() -> None:
+    secret = "ghp_" + "b" * 36
+    unsafe_name = f"/Users/ziruisu/{secret}"
+    provider = SequencedStreamProvider(
+        (
+            (
+                *_tool_use_stream_events(
+                    tool_use_id="toolu_unsafe",
+                    message_id="msg_tool",
+                    tool_name=unsafe_name,
+                    value=1,
+                ),
+                ModelStreamEvent.message_stop(
+                    _identity(message_id="msg_tool"),
+                    usage=Usage(output_tokens=4),
+                    stop_reason="tool_use",
+                ),
+            ),
+            _text_stream("done"),
+        )
+    )
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        config=_config(tools=()),
+        stream_callback=stream_events.append,
+    )
+
+    tool_events = [
+        event
+        for event in stream_events
+        if isinstance(event, SDKToolStart | SDKToolComplete)
+    ]
+    assert [event.tool_name for event in tool_events] == [
+        "[REDACTED_PATH]",
+        "[REDACTED_PATH]",
+    ]
+    assert unsafe_name not in repr(stream_events)
+    assert secret not in repr(stream_events)
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "done"
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_emits_unknown_tool_complete_status() -> None:
+    provider = SequencedStreamProvider((_tool_use_stream(), _text_stream("done")))
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        config=_config(tools=()),
+        stream_callback=stream_events.append,
+    )
+
+    tool_events = [
+        event
+        for event in stream_events
+        if isinstance(event, SDKToolStart | SDKToolProgress | SDKToolComplete)
+    ]
+    assert tool_events == [
+        SDKToolStart(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_1",
+            tool_name="Example",
+        ),
+        SDKToolComplete(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_1",
+            tool_name="Example",
+            status="unknown_tool",
+            summary="unknown tool",
+        ),
+    ]
+    assert "No such tool available" not in repr(tool_events)
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "done"
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_emits_permission_denied_complete_status() -> None:
+    async def deny(
+        _input: BaseModel,
+        _ctx: ToolUseContext,
+        _permission_context: ToolPermissionContext,
+    ) -> PermissionDenyDecision:
+        return PermissionDenyDecision(
+            message="SECRET_DENIED_REASON",
+            decision_reason=HookPermissionDecisionReason(hook_name="test"),
+        )
+
+    provider = SequencedStreamProvider((_tool_use_stream(), _text_stream("done")))
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        config=_config(tools=(_example_tool(check_permissions=deny),)),
+        stream_callback=stream_events.append,
+    )
+
+    tool_complete = next(
+        event for event in stream_events if isinstance(event, SDKToolComplete)
+    )
+    assert tool_complete == SDKToolComplete(
+        session_id="s",
+        turn_id="turn-1",
+        tool_use_id="toolu_1",
+        tool_name="Example",
+        status="denied",
+        summary="denied",
+    )
+    assert "SECRET_DENIED_REASON" not in repr(stream_events)
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "done"
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_emits_validation_error_complete_status() -> None:
+    async def validate(
+        _input: BaseModel,
+        _ctx: ToolUseContext,
+    ) -> ValidationOk | ValidationError:
+        return ValidationError(message="SECRET_VALIDATION_REASON")
+
+    provider = SequencedStreamProvider((_tool_use_stream(), _text_stream("done")))
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        config=_config(tools=(_example_tool(validate_input=validate),)),
+        stream_callback=stream_events.append,
+    )
+
+    tool_complete = next(
+        event for event in stream_events if isinstance(event, SDKToolComplete)
+    )
+    assert tool_complete == SDKToolComplete(
+        session_id="s",
+        turn_id="turn-1",
+        tool_use_id="toolu_1",
+        tool_name="Example",
+        status="validation_error",
+        summary="validation error",
+    )
+    assert "SECRET_VALIDATION_REASON" not in repr(stream_events)
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "done"
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_emits_execution_error_class_without_message() -> None:
+    async def call(
+        input_: BaseModel,
+        _ctx: ToolUseContext,
+    ) -> AsyncIterator[ToolCallEvent]:
+        if isinstance(input_, ExampleInput) and input_.value >= 0:
+            raise RuntimeError("SECRET_TOOL_EXCEPTION")
+        yield ToolResult(content="unreachable")
+
+    provider = SequencedStreamProvider((_tool_use_stream(), _text_stream("done")))
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        config=_config(tools=(_example_tool(call=call),)),
+        stream_callback=stream_events.append,
+    )
+
+    tool_complete = next(
+        event for event in stream_events if isinstance(event, SDKToolComplete)
+    )
+    assert tool_complete == SDKToolComplete(
+        session_id="s",
+        turn_id="turn-1",
+        tool_use_id="toolu_1",
+        tool_name="Example",
+        status="error",
+        summary="error",
+        error_type="RuntimeError",
+    )
+    assert "SECRET_TOOL_EXCEPTION" not in repr(stream_events)
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "done"
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_can_disable_tool_lifecycle_events() -> None:
+    provider = SequencedStreamProvider((_tool_use_stream(), _text_stream("done")))
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        config=_config(tools=(_example_tool(),)),
+        stream_callback=stream_events.append,
+        stream_options=SDKStreamOptions(tool_lifecycle=False),
+    )
+
+    assert not any(
+        isinstance(event, SDKToolStart | SDKToolProgress | SDKToolComplete)
+        for event in stream_events
+    )
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "done"
 
 
 @pytest.mark.asyncio
@@ -1186,10 +1491,12 @@ async def test_streaming_transport_fallback_discards_stale_tool_results(
             )
 
     store = JsonlTranscriptStore(tmp_path)
+    stream_events: list[SDKStreamEvent] = []
     engine, events = await _run_engine(
         FallbackProvider(()),
         config=_config(tools=(_example_tool(call),)),
         transcript_store=store,
+        stream_callback=stream_events.append,
     )
     release_old_tool.set()
     await asyncio.sleep(0)
@@ -1211,6 +1518,41 @@ async def test_streaming_transport_fallback_discards_stale_tool_results(
                 }
             ],
         }
+    ]
+    tool_stream_events = [
+        event
+        for event in stream_events
+        if isinstance(event, SDKToolStart | SDKToolComplete)
+    ]
+    assert tool_stream_events == [
+        SDKToolStart(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_old",
+            tool_name="Example",
+        ),
+        SDKToolComplete(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_old",
+            tool_name="Example",
+            status="interrupted",
+            summary="interrupted",
+        ),
+        SDKToolStart(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_replacement",
+            tool_name="Example",
+        ),
+        SDKToolComplete(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_replacement",
+            tool_name="Example",
+            status="completed",
+            summary="completed",
+        ),
     ]
     assert "stale old attempt" not in str(engine._messages)  # pyright: ignore[reportPrivateUsage]
 
@@ -1259,9 +1601,11 @@ async def test_model_fallback_discards_accepted_streamed_tool_use() -> None:
             )
 
     provider = ModelFallbackProvider(())
+    stream_events: list[SDKStreamEvent] = []
     engine, events = await _run_engine(
         provider,
         config=_config(tools=(_example_tool(call),)),
+        stream_callback=stream_events.append,
     )
     release_old_tool.set()
     await asyncio.sleep(0)
@@ -1276,6 +1620,27 @@ async def test_model_fallback_discards_accepted_streamed_tool_use() -> None:
         and isinstance(event.message.get("content"), list)
         for event in events
     )
+    tool_stream_events = [
+        event
+        for event in stream_events
+        if isinstance(event, SDKToolStart | SDKToolComplete)
+    ]
+    assert tool_stream_events == [
+        SDKToolStart(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_old",
+            tool_name="Example",
+        ),
+        SDKToolComplete(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_old",
+            tool_name="Example",
+            status="interrupted",
+            summary="interrupted",
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1312,9 +1677,11 @@ async def test_provider_error_discards_accepted_streamed_tool_use() -> None:
                 ),
             )
 
+    stream_events: list[SDKStreamEvent] = []
     engine, events = await _run_engine(
         ProviderErrorAfterToolUse(()),
         config=_config(tools=(_example_tool(call),)),
+        stream_callback=stream_events.append,
     )
     release_old_tool.set()
     await asyncio.sleep(0)
@@ -1326,6 +1693,27 @@ async def test_provider_error_discards_accepted_streamed_tool_use() -> None:
         for event in events
     )
     assert engine._messages[-1].get("isApiErrorMessage") is True  # pyright: ignore[reportPrivateUsage]
+    tool_stream_events = [
+        event
+        for event in stream_events
+        if isinstance(event, SDKToolStart | SDKToolComplete)
+    ]
+    assert tool_stream_events == [
+        SDKToolStart(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_old",
+            tool_name="Example",
+        ),
+        SDKToolComplete(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_old",
+            tool_name="Example",
+            status="interrupted",
+            summary="interrupted",
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1512,6 +1900,85 @@ async def test_abort_during_streamed_tool_drains_results_as_aborted_streaming() 
         },
         tool_result.message,
     ]
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_emits_aborted_complete_for_streamed_tool_abort() -> None:
+    tool_started = asyncio.Event()
+    ctx = _ctx()
+
+    async def call(
+        _input: BaseModel,
+        _ctx: ToolUseContext,
+    ) -> AsyncIterator[ToolCallEvent]:
+        tool_started.set()
+        await asyncio.Event().wait()
+        yield ToolResult(content="should not appear")
+
+    class AbortProvider(SequencedStreamProvider):
+        def stream(self, request: Any) -> AsyncIterator[ModelStreamEvent]:
+            self.stream_requests.append(request)
+            if len(self.stream_requests) > 1:
+                raise AssertionError("abort should terminate the turn")
+            return self._first_stream()
+
+        async def _first_stream(self) -> AsyncIterator[ModelStreamEvent]:
+            for event in _tool_use_stream_events(
+                tool_use_id="toolu_abort",
+                message_id="abort_msg",
+                value=1,
+            ):
+                yield event
+            await asyncio.wait_for(tool_started.wait(), timeout=1.0)
+            ctx.abort_event.set()
+            yield ModelStreamEvent.message_stop(
+                _identity(message_id="abort_msg"),
+                usage=Usage(output_tokens=4),
+                stop_reason="tool_use",
+            )
+
+    stream_events: list[SDKStreamEvent] = []
+    deps = QueryDeps(
+        task_store=AppStateStore(),
+        model_provider=AbortProvider(()),
+        permission_context=ToolPermissionContext(mode="bypassPermissions"),
+    )
+    engine = QueryEngine(
+        _config(tools=(_example_tool(call, interrupt_behavior="cancel"),)),
+        deps,
+        ctx,
+    )
+    events = [
+        event
+        async for event in engine.submit_message(
+            "hi",
+            stream_callback=stream_events.append,
+        )
+    ]
+
+    tool_stream_events = [
+        event
+        for event in stream_events
+        if isinstance(event, SDKToolStart | SDKToolComplete)
+    ]
+    assert tool_stream_events == [
+        SDKToolStart(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_abort",
+            tool_name="Example",
+        ),
+        SDKToolComplete(
+            session_id="s",
+            turn_id="turn-1",
+            tool_use_id="toolu_abort",
+            tool_name="Example",
+            status="aborted",
+            summary="aborted",
+        ),
+    ]
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].subtype == "error_aborted"
 
 
 @pytest.mark.asyncio

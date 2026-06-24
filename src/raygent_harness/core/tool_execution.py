@@ -43,6 +43,18 @@ if TYPE_CHECKING:
     from raygent_harness.core.tool import ToolUseContext
 
 
+ToolExecutionStatus = Literal[
+    "completed",
+    "failed",
+    "denied",
+    "aborted",
+    "interrupted",
+    "validation_error",
+    "unknown_tool",
+    "error",
+]
+
+
 @dataclass(frozen=True)
 class ToolExecutionProgress:
     type: Literal["progress"] = "progress"
@@ -61,6 +73,10 @@ class ToolExecutionResult:
             {"role": "user", "content": ""},
         )
     )
+    tool_use_id: str = ""
+    tool_name: str = ""
+    status: ToolExecutionStatus = "completed"
+    error_type: str | None = None
     permission_denials: tuple[PermissionDenial, ...] = ()
     pre_messages: tuple[MessageParam, ...] = ()
     """Messages emitted by PreToolUse hooks before the tool_result message."""
@@ -108,6 +124,8 @@ async def run_tool_use(
             tool_use.id,
             _tool_error(f"Error: No such tool available: {tool_use.name}"),
             is_error=True,
+            tool_name=tool_use.name,
+            status="unknown_tool",
         )
         return
     execution_ctx = replace(
@@ -147,6 +165,9 @@ async def run_tool_use(
             tool_use.id,
             _tool_error(f"Error validating tool ({tool.name}): {exc}"),
             is_error=True,
+            tool_name=tool.name,
+            status="validation_error",
+            error_type=type(exc).__name__,
         )
         _emit_tool_result_event(
             deps,
@@ -174,6 +195,8 @@ async def run_tool_use(
             tool_use.id,
             _tool_error(validation.message),
             is_error=True,
+            tool_name=tool.name,
+            status="validation_error",
         )
         _emit_tool_result_event(
             deps,
@@ -210,6 +233,9 @@ async def run_tool_use(
             tool_use.id,
             _tool_error(f"InputValidationError: {exc}"),
             is_error=True,
+            tool_name=tool.name,
+            status="validation_error",
+            error_type=type(exc).__name__,
         )
         _emit_tool_result_event(
             deps,
@@ -237,6 +263,9 @@ async def run_tool_use(
         reason = hook_outcome.stop_reason or "Execution stopped by PreToolUse hook"
         result = ToolExecutionResult(
             message=_tool_result_message(tool_use.id, _tool_error(reason), is_error=True),
+            tool_use_id=tool_use.id,
+            tool_name=tool.name,
+            status="interrupted",
             pre_messages=hook_outcome.additional_messages,
             should_prevent_continuation=hook_outcome.should_prevent_continuation,
             prevent_reason=reason,
@@ -290,6 +319,9 @@ async def run_tool_use(
             tool_use.id,
             _tool_error(f"InputValidationError: {exc}"),
             is_error=True,
+            tool_name=tool.name,
+            status="validation_error",
+            error_type=type(exc).__name__,
             pre_messages=hook_outcome.additional_messages,
             should_prevent_continuation=hook_outcome.should_prevent_continuation,
             prevent_reason=hook_outcome.stop_reason,
@@ -347,6 +379,9 @@ async def run_tool_use(
                 resolved.decision.message,
                 is_error=True,
             ),
+            tool_use_id=tool_use.id,
+            tool_name=tool.name,
+            status="denied",
             permission_denials=(denial,),
             pre_messages=hook_outcome.additional_messages,
             should_prevent_continuation=hook_outcome.should_prevent_continuation,
@@ -382,6 +417,9 @@ async def run_tool_use(
                 tool_use.id,
                 _tool_error(f"InputValidationError: {exc}"),
                 is_error=True,
+                tool_name=tool.name,
+                status="validation_error",
+                error_type=type(exc).__name__,
                 pre_messages=hook_outcome.additional_messages,
                 should_prevent_continuation=hook_outcome.should_prevent_continuation,
                 prevent_reason=hook_outcome.stop_reason,
@@ -447,6 +485,9 @@ async def run_tool_use(
                         event.content,
                         is_error=event.is_error,
                     ),
+                    tool_use_id=tool_use.id,
+                    tool_name=tool.name,
+                    status="failed" if event.is_error else "completed",
                     pre_messages=hook_outcome.additional_messages,
                     additional_messages=additional_messages,
                     context_modifier=event.context_modifier,
@@ -478,6 +519,9 @@ async def run_tool_use(
                 tool_use.id,
                 _tool_error(f"Error calling tool ({tool.name}): {event.message}"),
                 is_error=True,
+                tool_name=tool.name,
+                status="failed",
+                error_type=type(event).__name__,
                 pre_messages=hook_outcome.additional_messages,
                 should_prevent_continuation=hook_outcome.should_prevent_continuation,
                 prevent_reason=hook_outcome.stop_reason,
@@ -507,6 +551,8 @@ async def run_tool_use(
                 tool_use.id,
                 _tool_error(f"Error calling tool ({tool.name}): tool produced no result"),
                 is_error=True,
+                tool_name=tool.name,
+                status="failed",
                 pre_messages=hook_outcome.additional_messages,
                 should_prevent_continuation=hook_outcome.should_prevent_continuation,
                 prevent_reason=hook_outcome.stop_reason,
@@ -537,6 +583,9 @@ async def run_tool_use(
             tool_use.id,
             _tool_error(f"Error calling tool ({tool.name}): {exc}"),
             is_error=True,
+            tool_name=tool.name,
+            status="error",
+            error_type=type(exc).__name__,
             pre_messages=hook_outcome.additional_messages,
             should_prevent_continuation=hook_outcome.should_prevent_continuation,
             prevent_reason=hook_outcome.stop_reason,
@@ -571,6 +620,9 @@ def _parse_tool_input(tool: Tool, tool_use: ToolUseBlock) -> BaseModel | ToolExe
             tool_use.id,
             _tool_error(f"InputValidationError: {exc}"),
             is_error=True,
+            tool_name=tool.name,
+            status="validation_error",
+            error_type=type(exc).__name__,
         )
 
 
@@ -804,6 +856,9 @@ def _result(
     content: str | list[dict[str, Any]],
     *,
     is_error: bool,
+    tool_name: str = "",
+    status: ToolExecutionStatus | None = None,
+    error_type: str | None = None,
     pre_messages: tuple[MessageParam, ...] = (),
     additional_messages: tuple[MessageParam, ...] = (),
     should_prevent_continuation: bool = False,
@@ -811,6 +866,10 @@ def _result(
 ) -> ToolExecutionResult:
     return ToolExecutionResult(
         message=_tool_result_message(tool_use_id, content, is_error=is_error),
+        tool_use_id=tool_use_id,
+        tool_name=tool_name,
+        status=status or ("failed" if is_error else "completed"),
+        error_type=error_type,
         pre_messages=pre_messages,
         additional_messages=additional_messages,
         should_prevent_continuation=should_prevent_continuation,

@@ -261,20 +261,17 @@ def _cancelled_results(
     tool_uses: Sequence[ToolUseBlock],
     completed_tool_use_ids: set[str],
 ) -> Iterator[ToolExecutionResult]:
-    for message in _cancelled_tool_result_messages(tool_uses, completed_tool_use_ids):
+    for block in tool_uses:
+        if block.id in completed_tool_use_ids:
+            continue
+        message = _cancelled_tool_result_message(block.id)
         completed_tool_use_ids.update(_tool_result_ids((message,)))
-        yield ToolExecutionResult(message=message)
-
-
-def _cancelled_tool_result_messages(
-    tool_uses: Sequence[ToolUseBlock],
-    completed_tool_use_ids: set[str],
-) -> tuple[MessageParam, ...]:
-    return tuple(
-        _cancelled_tool_result_message(block.id)
-        for block in tool_uses
-        if block.id not in completed_tool_use_ids
-    )
+        yield ToolExecutionResult(
+            message=message,
+            tool_use_id=block.id,
+            tool_name=block.name,
+            status="aborted",
+        )
 
 
 def _cancelled_tool_result_message(tool_use_id: str) -> MessageParam:

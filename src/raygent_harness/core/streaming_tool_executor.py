@@ -163,7 +163,12 @@ class StreamingToolExecutor:
                     assistant_message=assistant_message,
                     is_concurrency_safe=True,
                     status="completed",
-                    result=_synthetic_result(block.id, STREAMING_FALLBACK_MESSAGE),
+                    result=_synthetic_result(
+                        block.id,
+                        STREAMING_FALLBACK_MESSAGE,
+                        tool_name=block.name,
+                        status="interrupted",
+                    ),
                 )
             )
             self._available.set()
@@ -192,6 +197,8 @@ class StreamingToolExecutor:
                         block.id,
                         f"<tool_use_error>Error: No such tool available: "
                         f"{block.name}</tool_use_error>",
+                        tool_name=block.name,
+                        status="unknown_tool",
                     ),
                 )
             )
@@ -311,19 +318,27 @@ class StreamingToolExecutor:
                     record.block.id,
                     "<tool_use_error>Error calling tool: tool produced no result"
                     "</tool_use_error>",
+                    tool_name=record.block.name,
+                    status="failed",
                 )
                 record.status = "completed"
                 self._available.set()
                 self._process_queue()
         except asyncio.CancelledError:
             if record.status == "executing":
-                self._complete_with_synthetic(record, TOOL_CANCEL_MESSAGE)
+                self._complete_with_synthetic(
+                    record,
+                    TOOL_CANCEL_MESSAGE,
+                    status="aborted",
+                )
         except Exception as exc:
             if record.status == "executing":
                 record.result = _synthetic_result(
                     record.block.id,
                     f"<tool_use_error>Error calling tool ({record.block.name}): "
                     f"{exc}</tool_use_error>",
+                    tool_name=record.block.name,
+                    status="error",
                 )
                 record.status = "completed"
                 self._available.set()
@@ -336,14 +351,25 @@ class StreamingToolExecutor:
             if record.status in {"queued", "executing"}:
                 self._complete_with_synthetic(record, self._sibling_error_message())
 
-    def _complete_with_synthetic(self, record: _TrackedTool, message: str) -> None:
+    def _complete_with_synthetic(
+        self,
+        record: _TrackedTool,
+        message: str,
+        *,
+        status: Literal["aborted", "interrupted", "failed"] = "interrupted",
+    ) -> None:
         if record.status == "yielded":
             return
         task = record.task
         if task is not None and not task.done():
             task.cancel()
         record.pending_progress.clear()
-        record.result = _synthetic_result(record.block.id, message)
+        record.result = _synthetic_result(
+            record.block.id,
+            message,
+            tool_name=record.block.name,
+            status=status,
+        )
         record.status = "completed"
         self._emit_tool_event(
             "tool.call.failed",
@@ -367,13 +393,21 @@ class StreamingToolExecutor:
             if record.status in {"completed", "yielded"}:
                 continue
             if record.status == "queued":
-                self._complete_with_synthetic(record, TOOL_CANCEL_MESSAGE)
+                self._complete_with_synthetic(
+                    record,
+                    TOOL_CANCEL_MESSAGE,
+                    status="aborted",
+                )
                 continue
             if record.status == "executing" and _interrupt_behavior(
                 record.block,
                 self._tools,
             ) == "cancel":
-                self._complete_with_synthetic(record, TOOL_CANCEL_MESSAGE)
+                self._complete_with_synthetic(
+                    record,
+                    TOOL_CANCEL_MESSAGE,
+                    status="aborted",
+                )
 
     def _pop_available_updates(self) -> list[StreamingToolUpdate]:
         updates: list[StreamingToolUpdate] = []
@@ -519,9 +553,24 @@ def _tool_input_shape(input_: object) -> dict[str, object]:
     }
 
 
-def _synthetic_result(tool_use_id: str, content: str) -> ToolExecutionResult:
+def _synthetic_result(
+    tool_use_id: str,
+    content: str,
+    *,
+    tool_name: str = "",
+    status: Literal[
+        "failed",
+        "aborted",
+        "interrupted",
+        "unknown_tool",
+        "error",
+    ] = "failed",
+) -> ToolExecutionResult:
     return ToolExecutionResult(
-        message=_tool_result_message(tool_use_id, content, is_error=True)
+        message=_tool_result_message(tool_use_id, content, is_error=True),
+        tool_use_id=tool_use_id,
+        tool_name=tool_name,
+        status=status,
     )
 
 

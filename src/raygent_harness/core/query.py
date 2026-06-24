@@ -237,6 +237,33 @@ class ToolProgressEvent:
 
 
 @dataclass(frozen=True)
+class ToolLifecycleEvent:
+    """Internal display-safe lifecycle fact for SDK stream mapping.
+
+    This carries start/complete metadata before tool results are flattened into
+    model-visible `tool_result` messages. It intentionally excludes raw tool
+    inputs and result bodies.
+    """
+
+    type: Literal["tool_lifecycle"] = "tool_lifecycle"
+    phase: Literal["start", "complete"] = "start"
+    tool_use_id: str = ""
+    tool_name: str = ""
+    status: Literal[
+        "completed",
+        "failed",
+        "denied",
+        "aborted",
+        "interrupted",
+        "validation_error",
+        "unknown_tool",
+        "error",
+    ] = "completed"
+    summary: str = ""
+    error_type: str | None = None
+
+
+@dataclass(frozen=True)
 class ToolOrchestrationComplete:
     """Internal completion carrier for one tool-use batch.
 
@@ -418,6 +445,7 @@ QueryEvent = (
     | AssistantMessage
     | ToolResultMessage
     | ToolProgressEvent
+    | ToolLifecycleEvent
     | ToolOrchestrationComplete
     | ModelStreamEventMessage
     | TaskNotificationsMessage
@@ -1131,6 +1159,7 @@ async def _call_model_streaming(
     ModelStreamEventMessage
     | TombstoneMessage
     | ToolProgressEvent
+    | ToolLifecycleEvent
     | ToolResultMessage
     | _StreamingModelResponse
 ]:
@@ -1209,11 +1238,19 @@ async def _call_model_streaming(
                             message_id=stream_event.identity.message_id,
                         )
                         streaming_executor.add_tool(tool_use, assistant_message)
+                        yield ToolLifecycleEvent(
+                            phase="start",
+                            tool_use_id=tool_use.id,
+                            tool_name=tool_use.name,
+                        )
 
             if stream_event.type == "streaming_transport_fallback_started":
                 fallback = update.streaming_transport_fallback
                 if streaming_executor is not None:
-                    streaming_executor.discard()
+                    async for event in _discard_streaming_tool_lifecycle(
+                        streaming_executor
+                    ):
+                        yield event
                 streaming_executor = _new_streaming_tool_executor(
                     config,
                     deps,
@@ -1243,14 +1280,22 @@ async def _call_model_streaming(
                 # executor make the query loop skip normal orchestration for its
                 # tool_use blocks.
                 if streaming_executor is not None:
-                    streaming_executor.discard("streaming_transport_fallback")
+                    async for event in _discard_streaming_tool_lifecycle(
+                        streaming_executor,
+                        reason="streaming_transport_fallback",
+                    ):
+                        yield event
                 streaming_executor = None
                 buffered_tool_result_messages.clear()
                 completed_blocks.clear()
 
             if update.provider_error is not None:
                 if streaming_executor is not None:
-                    streaming_executor.discard("provider_error")
+                    async for event in _discard_streaming_tool_lifecycle(
+                        streaming_executor,
+                        reason="provider_error",
+                    ):
+                        yield event
                     streaming_executor = None
                 failed_emitted = True
                 _emit_observability(
@@ -1269,7 +1314,11 @@ async def _call_model_streaming(
 
             if update.model_fallback is not None:
                 if streaming_executor is not None:
-                    streaming_executor.discard("model_fallback")
+                    async for event in _discard_streaming_tool_lifecycle(
+                        streaming_executor,
+                        reason="model_fallback",
+                    ):
+                        yield event
                     streaming_executor = None
                 failed_emitted = True
                 provider_error = ProviderError(
@@ -1809,7 +1858,7 @@ async def _drain_streaming_tool_completed(
     *,
     emit_results: bool,
     buffered_tool_result_messages: list[MessageParam] | None = None,
-) -> AsyncIterator[ToolProgressEvent | ToolResultMessage]:
+) -> AsyncIterator[ToolProgressEvent | ToolLifecycleEvent | ToolResultMessage]:
     """Map currently available streaming-tool updates to query events.
 
     Before the final assistant event has been yielded, result messages are
@@ -1821,6 +1870,7 @@ async def _drain_streaming_tool_completed(
             yield _tool_progress_event(update.progress)
             continue
 
+        yield _tool_lifecycle_complete_event(update.result)
         messages = _tool_result_messages_from_execution_result(update.result)
         if emit_results:
             for message in messages:
@@ -1831,14 +1881,29 @@ async def _drain_streaming_tool_completed(
 
 async def _drain_streaming_tool_remaining(
     executor: StreamingToolExecutor,
-) -> AsyncIterator[ToolProgressEvent | ToolResultMessage]:
+) -> AsyncIterator[ToolProgressEvent | ToolLifecycleEvent | ToolResultMessage]:
     """Drain the streaming executor after the final assistant message is visible."""
     async for update in executor.drain_remaining():
         if isinstance(update, StreamingToolProgressUpdate):
             yield _tool_progress_event(update.progress)
             continue
+        yield _tool_lifecycle_complete_event(update.result)
         for message in _tool_result_messages_from_execution_result(update.result):
             yield ToolResultMessage(message=message)
+
+
+async def _discard_streaming_tool_lifecycle(
+    executor: StreamingToolExecutor,
+    *,
+    reason: str = "streaming_fallback",
+) -> AsyncIterator[ToolLifecycleEvent]:
+    """Complete public lifecycle facts for stale streamed tools only."""
+
+    executor.discard(reason)
+    async for update in executor.drain_completed():
+        if isinstance(update, StreamingToolProgressUpdate):
+            continue
+        yield _tool_lifecycle_complete_event(update.result)
 
 
 def _tool_progress_event(progress: ToolExecutionProgress) -> ToolProgressEvent:
@@ -1854,6 +1919,23 @@ def _tool_result_messages_from_execution_result(
     result: ToolExecutionResult,
 ) -> tuple[MessageParam, ...]:
     return (*result.pre_messages, result.message, *result.additional_messages)
+
+
+def _tool_lifecycle_complete_event(result: ToolExecutionResult) -> ToolLifecycleEvent:
+    return ToolLifecycleEvent(
+        phase="complete",
+        tool_use_id=result.tool_use_id,
+        tool_name=result.tool_name,
+        status=result.status,
+        summary=_tool_lifecycle_summary(result),
+        error_type=result.error_type,
+    )
+
+
+def _tool_lifecycle_summary(result: ToolExecutionResult) -> str:
+    if result.status == "completed":
+        return "completed"
+    return result.status.replace("_", " ")
 
 
 def _streaming_tool_orchestration_complete(
@@ -1951,6 +2033,13 @@ async def _orchestrate_tools(
     tool_use_blocks = normalize_assistant_turn(assistant_message).tool_uses
     outcome: ToolOrchestrationOutcome | None = None
 
+    for block in tool_use_blocks:
+        yield ToolLifecycleEvent(
+            phase="start",
+            tool_use_id=block.id,
+            tool_name=block.name,
+        )
+
     async for event in run_tools(
         tool_uses=tool_use_blocks,
         assistant_message=assistant_message,
@@ -1973,6 +2062,7 @@ async def _orchestrate_tools(
             )
             continue
         if isinstance(event, ToolExecutionResult):
+            yield _tool_lifecycle_complete_event(event)
             for message in (*event.pre_messages, event.message, *event.additional_messages):
                 yield ToolResultMessage(message=message)
             continue
@@ -3385,6 +3475,7 @@ __all__ = [
     "TerminalEvent",
     "TerminalReason",
     "TombstoneMessage",
+    "ToolLifecycleEvent",
     "ToolProgressEvent",
     "ToolResultMessage",
     "query",
