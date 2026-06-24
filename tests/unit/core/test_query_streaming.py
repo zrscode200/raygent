@@ -24,6 +24,7 @@ from raygent_harness.core.model_types import (
     ProviderError,
     StreamIdentity,
     TextContentBlock,
+    ThinkingContentBlock,
     ToolUseContentBlock,
     Usage,
 )
@@ -42,7 +43,12 @@ from raygent_harness.core.query import (
 from raygent_harness.core.query_engine import (
     QueryEngine,
     SDKAssistantMessage,
+    SDKMessageDelta,
+    SDKReasoningAvailable,
     SDKResult,
+    SDKStreamEvent,
+    SDKStreamEventCallback,
+    SDKStreamOptions,
     SDKSystemInit,
     SDKUserMessage,
 )
@@ -258,6 +264,88 @@ def _text_stream(text: str) -> tuple[ModelStreamEvent, ...]:
     )
 
 
+def _unknown_text_shape_stream(text: str) -> tuple[ModelStreamEvent, ...]:
+    return (
+        ModelStreamEvent.message_start(_identity()),
+        ModelStreamEvent.content_block_start(
+            _identity(block_index=0),
+            block=TextContentBlock(text=""),
+        ),
+        ModelStreamEvent.content_block_delta(
+            _identity(block_index=0),
+            delta={"type": "provider_text_delta", "text": text},
+        ),
+        ModelStreamEvent.content_block_stop(_identity(block_index=0)),
+        ModelStreamEvent.message_stop(_identity(), stop_reason="end_turn"),
+    )
+
+
+def _text_stream_without_message_id(text: str) -> tuple[ModelStreamEvent, ...]:
+    identity = StreamIdentity(
+        message_id=None,
+        content_block_index=None,
+        provider_request_id="provider-request-secret",
+        attempt_id="attempt-secret",
+    )
+    block_identity = StreamIdentity(
+        message_id=None,
+        content_block_index=0,
+        provider_request_id="provider-request-secret",
+        attempt_id="attempt-secret",
+    )
+    return (
+        ModelStreamEvent.message_start(identity),
+        ModelStreamEvent.content_block_start(
+            block_identity,
+            block=TextContentBlock(text=""),
+        ),
+        ModelStreamEvent.content_block_delta(
+            block_identity,
+            delta={"type": "text_delta", "text": text},
+        ),
+        ModelStreamEvent.content_block_stop(block_identity),
+        ModelStreamEvent.message_stop(identity, stop_reason="end_turn"),
+    )
+
+
+def _reasoning_stream() -> tuple[ModelStreamEvent, ...]:
+    return (
+        ModelStreamEvent.message_start(_identity()),
+        ModelStreamEvent.content_block_start(
+            _identity(block_index=0),
+            block=ThinkingContentBlock(
+                text="secret plan",
+                signature="secret-signature",
+                redacted=True,
+                provider_metadata={"encrypted_content": "sealed-reasoning"},
+            ),
+        ),
+        ModelStreamEvent.content_block_delta(
+            _identity(block_index=0),
+            delta={"type": "thinking_delta", "thinking": "hidden continuation"},
+        ),
+        ModelStreamEvent.content_block_delta(
+            _identity(block_index=0),
+            delta={"type": "signature_delta", "signature": "secret-signature-2"},
+        ),
+        ModelStreamEvent.content_block_stop(_identity(block_index=0)),
+        ModelStreamEvent.content_block_start(
+            _identity(block_index=1),
+            block=TextContentBlock(text=""),
+        ),
+        ModelStreamEvent.content_block_delta(
+            _identity(block_index=1),
+            delta={"type": "text_delta", "text": "visible answer"},
+        ),
+        ModelStreamEvent.content_block_stop(_identity(block_index=1)),
+        ModelStreamEvent.message_stop(
+            _identity(),
+            usage=Usage(output_tokens=2, reasoning_tokens=7),
+            stop_reason="end_turn",
+        ),
+    )
+
+
 def _tool_use_stream() -> tuple[ModelStreamEvent, ...]:
     return (
         *_tool_use_stream_events(
@@ -304,6 +392,8 @@ async def _run_engine(
     config: QueryConfig | None = None,
     transcript_store: JsonlTranscriptStore | None = None,
     observability: KernelEventBus | None = None,
+    stream_callback: SDKStreamEventCallback | None = None,
+    stream_options: SDKStreamOptions | None = None,
 ) -> tuple[QueryEngine, list[Any]]:
     deps = QueryDeps(
         task_store=AppStateStore(),
@@ -313,8 +403,189 @@ async def _run_engine(
         permission_context=ToolPermissionContext(mode="bypassPermissions"),
     )
     engine = QueryEngine(config or _config(), deps, _ctx())
-    events = [event async for event in engine.submit_message("hi")]
+    events = [
+        event
+        async for event in engine.submit_message(
+            "hi",
+            stream_callback=stream_callback,
+            stream_options=stream_options,
+        )
+    ]
     return engine, events
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_emits_bounded_text_deltas_only_via_callback() -> None:
+    provider = FakeModelProvider(stream_events=_text_stream("streamed"))
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        stream_callback=stream_events.append,
+        stream_options=SDKStreamOptions(max_text_delta_chars=4),
+    )
+
+    assert [event for event in events if isinstance(event, SDKMessageDelta)] == []
+    assert stream_events == [
+        SDKMessageDelta(
+            session_id="s",
+            turn_id="turn-1",
+            stream_id="msg_1",
+            text="stre",
+            index=0,
+            is_final=False,
+        ),
+        SDKMessageDelta(
+            session_id="s",
+            turn_id="turn-1",
+            stream_id="msg_1",
+            text="amed",
+            index=0,
+            is_final=False,
+        ),
+    ]
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "streamed"
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_id_fallback_does_not_expose_provider_request_ids() -> None:
+    provider = FakeModelProvider(stream_events=_text_stream_without_message_id("safe"))
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        stream_callback=stream_events.append,
+    )
+
+    assert stream_events == [
+        SDKMessageDelta(
+            session_id="s",
+            turn_id="turn-1",
+            stream_id="turn-1",
+            text="safe",
+            index=0,
+            is_final=False,
+        )
+    ]
+    assert "provider-request-secret" not in repr(stream_events)
+    assert "attempt-secret" not in repr(stream_events)
+    assert isinstance(events[-1], SDKResult)
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_respects_text_delta_option() -> None:
+    provider = FakeModelProvider(stream_events=_text_stream("suppressed"))
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        stream_callback=stream_events.append,
+        stream_options=SDKStreamOptions(text_deltas=False),
+    )
+
+    assert stream_events == []
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "suppressed"
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_ignores_unknown_text_shapes() -> None:
+    provider = FakeModelProvider(stream_events=_unknown_text_shape_stream("private"))
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        stream_callback=stream_events.append,
+    )
+
+    assert stream_events == []
+    assert isinstance(events[-1], SDKResult)
+    assert events[-1].result == "private"
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_emits_reasoning_availability_without_content() -> None:
+    provider = FakeModelProvider(stream_events=_reasoning_stream())
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        stream_callback=stream_events.append,
+    )
+
+    reasoning_events = [
+        event for event in stream_events if isinstance(event, SDKReasoningAvailable)
+    ]
+    assert reasoning_events == [
+        SDKReasoningAvailable(
+            session_id="s",
+            turn_id="turn-1",
+            stream_id="msg_1",
+            char_count=len("secret plan"),
+        ),
+        SDKReasoningAvailable(
+            session_id="s",
+            turn_id="turn-1",
+            stream_id="msg_1",
+            char_count=len("hidden continuation"),
+        ),
+        SDKReasoningAvailable(
+            session_id="s",
+            turn_id="turn-1",
+            stream_id="msg_1",
+            token_count=7,
+        ),
+    ]
+    assert [
+        event.text for event in stream_events if isinstance(event, SDKMessageDelta)
+    ] == ["visible answer"]
+    assert "secret plan" not in repr(reasoning_events)
+    assert "hidden continuation" not in repr(reasoning_events)
+    assert "secret-signature" not in repr(reasoning_events)
+    assert isinstance(events[-1], SDKResult)
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_suppresses_tool_input_json_deltas() -> None:
+    provider = FakeModelProvider(stream_events=_tool_use_stream())
+    stream_events: list[SDKStreamEvent] = []
+
+    _engine, events = await _run_engine(
+        provider,
+        config=_config(tools=(_example_tool(),)),
+        stream_callback=stream_events.append,
+    )
+
+    assert stream_events == []
+    assert "partial_json" not in repr(stream_events)
+    assert "value" not in repr(stream_events)
+    assert isinstance(events[-1], SDKResult)
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_callback_exception_propagates_without_sdk_error_result() -> None:
+    provider = FakeModelProvider(stream_events=_text_stream("boom"))
+    deps = QueryDeps(
+        task_store=AppStateStore(),
+        model_provider=provider,
+        observability=KernelEventBus(),
+        permission_context=ToolPermissionContext(mode="bypassPermissions"),
+    )
+    engine = QueryEngine(_config(), deps, _ctx())
+    yielded_events: list[Any] = []
+
+    def broken_callback(_event: SDKStreamEvent) -> None:
+        raise RuntimeError("stream callback failed")
+
+    with pytest.raises(RuntimeError, match="stream callback failed"):
+        async for event in engine.submit_message(
+            "hi",
+            stream_callback=broken_callback,
+        ):
+            yielded_events.append(event)
+
+    assert [type(event) for event in yielded_events] == [SDKSystemInit]
 
 
 @pytest.mark.asyncio

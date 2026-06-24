@@ -32,8 +32,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
-from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -333,6 +334,14 @@ SDKStreamEvent = (
 SDKStreamEventCallback = Callable[[SDKStreamEvent], object]
 
 
+class _SDKStreamCallbackError(Exception):
+    """Internal wrapper so SDK stream callback failures bypass result conversion."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
 # ---------------------------------------------------------------------------
 # QueryEngine — the conversation container.
 # ---------------------------------------------------------------------------
@@ -497,13 +506,11 @@ class QueryEngine:
         """
         if stream_callback is not None and stream_options is None:
             stream_options = SDKStreamOptions()
-        # SDK-STREAM-001A only threads the opt-in sink through the public
-        # boundary. Event mapping is added in later waves.
-        _ = stream_callback, stream_options
 
         self._turn_index += 1
+        turn_id = f"turn-{self._turn_index}"
         event_context = self._observability_context(
-            turn_id=f"turn-{self._turn_index}",
+            turn_id=turn_id,
             source="query_engine",
         )
         self._emit_observability(
@@ -621,13 +628,20 @@ class QueryEngine:
                             turn_config,
                         )
                         break
-                    translated = await self._translate_event(event)
+                    translated = await self._translate_event(
+                        event,
+                        stream_callback=stream_callback,
+                        stream_options=stream_options,
+                        turn_id=turn_id,
+                    )
                     if translated is None:
                         continue
                     yield translated
         except GeneratorExit:
             # Caller closed the generator — honor it without emitting a terminal.
             raise
+        except _SDKStreamCallbackError as err:
+            raise err.error from None
         except Exception as err:
             await self._flush_transcript()
             result = self._build_error_result(
@@ -1316,7 +1330,14 @@ class QueryEngine:
     # Event translation — one switch per QueryEvent variant.
     # -----------------------------------------------------------------
 
-    async def _translate_event(self, event: Any) -> SDKMessage | None:
+    async def _translate_event(
+        self,
+        event: Any,
+        *,
+        stream_callback: SDKStreamEventCallback | None = None,
+        stream_options: SDKStreamOptions | None = None,
+        turn_id: str | None = None,
+    ) -> SDKMessage | None:
         """Map an internal `QueryEvent` to an `SDKMessage`. None = absorbed.
 
         Side effects: append to `self._messages`, update usage/denials.
@@ -1422,6 +1443,13 @@ class QueryEngine:
 
         if isinstance(event, _QueryModelStreamEvent):
             await self._record_stream_event(event)
+            if stream_callback is not None and stream_options is not None:
+                await self._emit_sdk_stream_events(
+                    event,
+                    stream_callback,
+                    stream_options,
+                    turn_id=turn_id,
+                )
             return None
 
         if isinstance(event, _QueryCompactBoundary):
@@ -1437,6 +1465,27 @@ class QueryEngine:
             return None
 
         return None
+
+    async def _emit_sdk_stream_events(
+        self,
+        event: _QueryModelStreamEvent,
+        callback: SDKStreamEventCallback,
+        options: SDKStreamOptions,
+        *,
+        turn_id: str | None,
+    ) -> None:
+        for stream_event in _sdk_stream_events_from_model_stream_event(
+            event,
+            session_id=self._config.session_id,
+            turn_id=turn_id,
+            options=options,
+        ):
+            try:
+                result = callback(stream_event)
+                if inspect.isawaitable(result):
+                    await cast(Awaitable[object], result)
+            except Exception as err:
+                raise _SDKStreamCallbackError(err) from err
 
     # -----------------------------------------------------------------
     # Terminal construction
@@ -1834,6 +1883,138 @@ class QueryEngine:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _sdk_stream_events_from_model_stream_event(
+    event: _QueryModelStreamEvent,
+    *,
+    session_id: str,
+    turn_id: str | None,
+    options: SDKStreamOptions,
+) -> tuple[SDKStreamEvent, ...]:
+    payload = event.event
+    event_type = payload.get("type")
+    if not isinstance(event_type, str):
+        return ()
+
+    identity = _mapping_value(payload.get("identity"))
+    stream_id = _sdk_stream_id(identity, turn_id)
+    index = _int_value(identity.get("content_block_index")) if identity else None
+    events: list[SDKStreamEvent] = []
+
+    if options.text_deltas and event_type == "content_block_delta":
+        delta = _mapping_value(payload.get("delta"))
+        if delta is not None and delta.get("type") == "text_delta":
+            text = delta.get("text")
+            if isinstance(text, str) and text:
+                events.extend(
+                    SDKMessageDelta(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        stream_id=stream_id,
+                        text=chunk,
+                        index=index,
+                        is_final=False,
+                    )
+                    for chunk in _chunk_stream_text(
+                        text,
+                        max_chars=options.max_text_delta_chars,
+                    )
+                )
+
+    if options.reasoning_available:
+        reasoning = _sdk_reasoning_available_event(
+            payload,
+            event_type=event_type,
+            session_id=session_id,
+            turn_id=turn_id,
+            stream_id=stream_id,
+        )
+        if reasoning is not None:
+            events.append(reasoning)
+
+    return tuple(events)
+
+
+def _sdk_reasoning_available_event(
+    payload: Mapping[str, Any],
+    *,
+    event_type: str,
+    session_id: str,
+    turn_id: str | None,
+    stream_id: str,
+) -> SDKReasoningAvailable | None:
+    if event_type == "content_block_start":
+        block = _mapping_value(payload.get("block"))
+        if block is not None and block.get("type") == "thinking":
+            text = block.get("text")
+            return SDKReasoningAvailable(
+                session_id=session_id,
+                turn_id=turn_id,
+                stream_id=stream_id,
+                char_count=len(text) if isinstance(text, str) else None,
+                token_count=None,
+            )
+
+    if event_type == "content_block_delta":
+        delta = _mapping_value(payload.get("delta"))
+        if delta is None:
+            return None
+        delta_type = delta.get("type")
+        if delta_type == "thinking_delta":
+            thinking = delta.get("thinking")
+            return SDKReasoningAvailable(
+                session_id=session_id,
+                turn_id=turn_id,
+                stream_id=stream_id,
+                char_count=len(thinking) if isinstance(thinking, str) else None,
+                token_count=None,
+            )
+
+    usage = _mapping_value(payload.get("usage"))
+    reasoning_tokens = (
+        _int_value(usage.get("reasoning_tokens")) if usage is not None else None
+    )
+    if reasoning_tokens is not None and reasoning_tokens > 0:
+        return SDKReasoningAvailable(
+            session_id=session_id,
+            turn_id=turn_id,
+            stream_id=stream_id,
+            char_count=None,
+            token_count=reasoning_tokens,
+        )
+    return None
+
+
+def _mapping_value(value: object) -> Mapping[str, Any] | None:
+    if isinstance(value, Mapping):
+        return cast(Mapping[str, Any], value)
+    return None
+
+
+def _int_value(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _sdk_stream_id(
+    identity: Mapping[str, Any] | None,
+    turn_id: str | None,
+) -> str:
+    if identity is not None:
+        message_id = identity.get("message_id")
+        if isinstance(message_id, str) and message_id:
+            return message_id
+    return turn_id or "stream"
+
+
+def _chunk_stream_text(text: str, *, max_chars: int) -> tuple[str, ...]:
+    return tuple(
+        text[index : index + max_chars] for index in range(0, len(text), max_chars)
+    )
 
 
 _AGENT_TRIGGER_TRUNCATION_MARKER = "\n[agent trigger guidance truncated]"
