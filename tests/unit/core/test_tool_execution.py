@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from typing import Any
+from collections.abc import AsyncIterator, Sequence
+from typing import Any, ClassVar
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from raygent_harness.core.deps import QueryDeps
 from raygent_harness.core.model_adapter import ToolUseBlock
@@ -42,7 +42,11 @@ class ExampleInput(BaseModel):
     flag: bool = False
 
 
-def _ctx(*, aborted: bool = False) -> ToolUseContext:
+def _ctx(
+    *,
+    aborted: bool = False,
+    discovered: Sequence[str] = (),
+) -> ToolUseContext:
     abort_event = asyncio.Event()
     if aborted:
         abort_event.set()
@@ -53,6 +57,7 @@ def _ctx(*, aborted: bool = False) -> ToolUseContext:
         rendered_system_prompt="",
         cwd=".",
         query_tracking=QueryTracking(chain_id="c", depth=0),
+        discovered_tool_names=frozenset(discovered),
     )
 
 
@@ -76,10 +81,16 @@ def _tool(
     validate_raises: Exception | None = None,
     events: list[ToolCallEvent] | None = None,
     raise_error: BaseException | None = None,
-    seen_inputs: list[ExampleInput] | None = None,
+    seen_inputs: list[Any] | None = None,
     check_permissions: Any | None = None,
+    input_model: type[BaseModel] = ExampleInput,
+    should_defer: bool = False,
+    always_load: bool = False,
+    validate_seen: list[BaseModel] | None = None,
 ) -> Tool:
     async def validate(input_: BaseModel, _ctx: ToolUseContext) -> ValidationOk | ValidationError:
+        if validate_seen is not None:
+            validate_seen.append(input_)
         if validate_raises is not None:
             raise validate_raises
         if validate_error is not None:
@@ -90,7 +101,7 @@ def _tool(
         input_: BaseModel,
         _ctx: ToolUseContext,
     ) -> AsyncIterator[ToolCallEvent]:
-        assert isinstance(input_, ExampleInput)
+        assert isinstance(input_, input_model)
         if seen_inputs is not None:
             seen_inputs.append(input_)
         if raise_error is not None:
@@ -103,12 +114,14 @@ def _tool(
             name=name,
             aliases=aliases,
             description=f"{name} tool",
-            input_model=ExampleInput,
+            input_model=input_model,
             call=call,
             validate_input=validate,
             check_permissions=check_permissions,
             is_read_only=True,
             is_concurrency_safe=True,
+            should_defer=should_defer,
+            always_load=always_load,
         )
     )
 
@@ -162,6 +175,105 @@ async def test_unknown_tool_returns_model_visible_error_result() -> None:
     assert block["tool_use_id"] == "toolu_1"
     assert block["is_error"] is True
     assert "No such tool available: Missing" in str(block["content"])
+
+
+@pytest.mark.asyncio
+async def test_hidden_deferred_tool_returns_error_before_side_effect_gates() -> None:
+    parse_seen: list[Any] = []
+    validate_seen: list[BaseModel] = []
+    permission_seen: list[BaseModel] = []
+    hook_seen: list[str] = []
+    call_seen: list[Any] = []
+
+    class CountingInput(BaseModel):
+        parsed: ClassVar[list[Any]] = parse_seen
+
+        command: str
+
+        @model_validator(mode="before")
+        @classmethod
+        def count_parse(cls, data: Any) -> Any:
+            cls.parsed.append(data)
+            return data
+
+    async def check_permissions(
+        input_: BaseModel,
+        _ctx: ToolUseContext,
+        _permission_context: ToolPermissionContext,
+    ) -> PermissionAllowDecision:
+        permission_seen.append(input_)
+        return PermissionAllowDecision()
+
+    async def hook(_context: PreToolUseContext) -> PreToolUseResult:
+        hook_seen.append("hook")
+        return PreToolUseResult()
+
+    events = await _collect(
+        _tool_use(),
+        (
+            _tool(
+                input_model=CountingInput,
+                should_defer=True,
+                validate_seen=validate_seen,
+                seen_inputs=call_seen,
+                check_permissions=check_permissions,
+            ),
+        ),
+        _deps(pre_hooks=[hook]),
+    )
+
+    result = events[0]
+    assert isinstance(result, ToolExecutionResult)
+    assert result.status == "unknown_tool"
+    assert "must be selected with ToolSearch" in str(_content(result))
+    assert parse_seen == []
+    assert validate_seen == []
+    assert hook_seen == []
+    assert permission_seen == []
+    assert call_seen == []
+
+
+@pytest.mark.asyncio
+async def test_selected_deferred_tool_primary_and_alias_names_execute() -> None:
+    tool = _tool(
+        name="Deferred",
+        aliases=("DeferredAlias",),
+        should_defer=True,
+    )
+
+    alias_events = await _collect(
+        _tool_use(name="DeferredAlias"),
+        (tool,),
+        _deps(),
+        _ctx(discovered=("Deferred",)),
+    )
+    primary_events = await _collect(
+        _tool_use(name="Deferred"),
+        (tool,),
+        _deps(),
+        _ctx(discovered=("DeferredAlias",)),
+    )
+
+    assert isinstance(alias_events[0], ToolExecutionResult)
+    assert isinstance(primary_events[0], ToolExecutionResult)
+    assert alias_events[0].status == "completed"
+    assert primary_events[0].status == "completed"
+    assert _content(alias_events[0]) == "ok"
+    assert _content(primary_events[0]) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_always_load_deferred_tool_executes_without_selection() -> None:
+    events = await _collect(
+        _tool_use(),
+        (_tool(should_defer=True, always_load=True),),
+        _deps(),
+    )
+
+    result = events[0]
+    assert isinstance(result, ToolExecutionResult)
+    assert result.status == "completed"
+    assert _content(result) == "ok"
 
 
 @pytest.mark.asyncio

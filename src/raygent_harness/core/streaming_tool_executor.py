@@ -19,10 +19,11 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from raygent_harness.core.model_adapter import ToolUseBlock
 from raygent_harness.core.observability import KernelEventContext, redacted_payload
-from raygent_harness.core.tool import find_tool_by_name
+from raygent_harness.core.tool import find_tool_by_name, tool_visible_to_model
 from raygent_harness.core.tool_execution import (
     ToolExecutionProgress,
     ToolExecutionResult,
+    deferred_tool_not_selected_result,
     run_tool_use,
 )
 from raygent_harness.core.tool_orchestration import TOOL_CANCEL_MESSAGE
@@ -107,6 +108,7 @@ class StreamingToolExecutor:
         self._bash_error_description = ""
         self._available = asyncio.Event()
         self._tool_result_messages: list[MessageParam] = []
+        self._discovered_tool_names: set[str] = set()
         self._permission_denials: list[PermissionDenial] = []
         self._should_prevent_continuation = False
         self._prevent_reason: str | None = None
@@ -118,6 +120,10 @@ class StreamingToolExecutor:
     @property
     def tool_result_messages(self) -> tuple[MessageParam, ...]:
         return tuple(self._tool_result_messages)
+
+    @property
+    def discovered_tool_names(self) -> frozenset[str]:
+        return frozenset(self._discovered_tool_names)
 
     @property
     def permission_denials(self) -> tuple[PermissionDenial, ...]:
@@ -204,12 +210,42 @@ class StreamingToolExecutor:
             )
             self._available.set()
             return
+        if not tool_visible_to_model(tool, self._current_context.discovered_tool_names):
+            self._emit_tool_event(
+                "tool.call.failed",
+                block,
+                {
+                    "sequence": sequence,
+                    "streaming": True,
+                    "failure_reason": "deferred_tool_not_selected",
+                    "result": redacted_payload("tool_result_redacted"),
+                },
+            )
+            self._records.append(
+                _TrackedTool(
+                    sequence=sequence,
+                    block=block,
+                    assistant_message=assistant_message,
+                    is_concurrency_safe=True,
+                    status="completed",
+                    result=deferred_tool_not_selected_result(
+                        tool_use_id=block.id,
+                        tool_name=block.name,
+                    ),
+                )
+            )
+            self._available.set()
+            return
 
         record = _TrackedTool(
             sequence=sequence,
             block=block,
             assistant_message=assistant_message,
-            is_concurrency_safe=_is_concurrency_safe(block, self._tools),
+            is_concurrency_safe=_is_concurrency_safe(
+                block,
+                self._tools,
+                self._current_context,
+            ),
         )
         self._records.append(record)
         self._process_queue()
@@ -451,6 +487,7 @@ class StreamingToolExecutor:
     def _record_result(self, result: ToolExecutionResult) -> None:
         messages = (*result.pre_messages, result.message, *result.additional_messages)
         self._tool_result_messages.extend(messages)
+        self._discovered_tool_names.update(result.discovered_tool_names)
         self._permission_denials.extend(result.permission_denials)
         self._should_prevent_continuation = (
             self._should_prevent_continuation or result.should_prevent_continuation
@@ -486,9 +523,12 @@ class StreamingToolExecutor:
 def _is_concurrency_safe(
     tool_use: ToolUseBlock,
     tools: Sequence[Tool],
+    ctx: ToolUseContext,
 ) -> bool:
     tool = find_tool_by_name(tools, tool_use.name)
     if tool is None:
+        return False
+    if not tool_visible_to_model(tool, ctx.discovered_tool_names):
         return False
     try:
         parsed = tool.input_model.model_validate(tool_use.input)

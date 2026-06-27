@@ -8,7 +8,7 @@ hooks, and fail-closed defaults via `build_tool`.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
@@ -452,6 +452,9 @@ class ToolResult(BaseModel):
     additional_messages: tuple[dict[str, Any], ...] = ()
     """Reference-style `newMessages` emitted after the tool_result block."""
 
+    discovered_tool_names: tuple[str, ...] = ()
+    """Trusted runtime metadata emitted by ToolSearch only."""
+
     context_modifier: ToolContextModifier | None = None
     """Reference-style context modifier applied after this tool result."""
 
@@ -783,3 +786,32 @@ def find_tool_by_name(tools: Sequence[Tool], name: str) -> Tool | None:
         if tool_matches_name(t, name):
             return t
     return None
+
+
+def tool_selected_by_name(
+    tool: Tool,
+    selected_tool_names: Collection[str] | None = None,
+) -> bool:
+    """Whether a prior ToolSearch result selected a tool by primary or alias."""
+
+    if not selected_tool_names:
+        return False
+    return tool.name in selected_tool_names or any(
+        alias in selected_tool_names for alias in tool.aliases
+    )
+
+
+def tool_visible_to_model(
+    tool: Tool,
+    selected_tool_names: Collection[str] | None = None,
+) -> bool:
+    """Return whether a tool should be visible/callable for model output."""
+
+    try:
+        if not tool.is_enabled():
+            return False
+    except Exception:
+        return False
+    if tool_selected_by_name(tool, selected_tool_names):
+        return True
+    return tool.always_load or not tool.should_defer

@@ -57,7 +57,14 @@ def _base_tool(name: str) -> Tool:
     )
 
 
-def _ctx(*, tools: Sequence[Tool] = (), agent_id: str | None = None) -> ToolUseContext:
+def _ctx(
+    *,
+    tools: Sequence[Tool] = (),
+    agent_id: str | None = None,
+    discovered: Sequence[str] | None = None,
+) -> ToolUseContext:
+    if discovered is None:
+        discovered = (TASK_STOP_TOOL_NAME,)
     return ToolUseContext(
         session_id="s",
         agent_id=agent_id,
@@ -66,6 +73,7 @@ def _ctx(*, tools: Sequence[Tool] = (), agent_id: str | None = None) -> ToolUseC
         cwd=".",
         tools=tuple(tools),
         query_tracking=QueryTracking(chain_id="c", depth=0),
+        discovered_tool_names=frozenset(discovered),
     )
 
 
@@ -262,6 +270,63 @@ async def test_task_stop_tool_accepts_killshell_alias_and_shell_id() -> None:
 
     assert not _is_error(result)
     assert store.tasks["legacy_shell"].status == "killed"
+
+
+@pytest.mark.asyncio
+async def test_task_stop_tool_raw_killshell_alias_is_blocked_before_selection() -> None:
+    store = AppStateStore()
+    task = LocalAgentState(
+        id="legacy_shell",
+        type="local_agent",
+        description="legacy task",
+        status="running",
+        start_time=1.0,
+        parent_agent_id=None,
+        prompt="work",
+    )
+    store.register_task(task)
+    deps = _deps(store)
+    tool = build_task_stop_tool(deps=deps)
+
+    result = await _run_task_stop(
+        tool=tool,
+        deps=deps,
+        ctx=_ctx(tools=(tool,), discovered=()),
+        input_={"shell_id": "legacy_shell"},
+        tool_name="KillShell",
+    )
+
+    assert _is_error(result)
+    assert result.status == "unknown_tool"
+    assert "must be selected with ToolSearch" in str(_content(result))
+    assert store.tasks["legacy_shell"].status == "running"
+
+
+@pytest.mark.asyncio
+async def test_task_stop_tool_selected_alias_history_allows_primary_name() -> None:
+    store = AppStateStore()
+    task = LocalAgentState(
+        id="a_worker",
+        type="local_agent",
+        description="worker",
+        status="running",
+        start_time=1.0,
+        parent_agent_id=None,
+        prompt="work",
+    )
+    store.register_task(task)
+    deps = _deps(store)
+    tool = build_task_stop_tool(deps=deps)
+
+    result = await _run_task_stop(
+        tool=tool,
+        deps=deps,
+        ctx=_ctx(tools=(tool,), discovered=("KillShell",)),
+        input_={"task_id": "a_worker"},
+    )
+
+    assert not _is_error(result)
+    assert store.tasks["a_worker"].status == "killed"
 
 
 def test_task_stop_tool_reference_metadata() -> None:

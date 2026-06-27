@@ -54,7 +54,15 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -126,7 +134,14 @@ from raygent_harness.core.streaming_tool_executor import (
     StreamingToolProgressUpdate,
 )
 from raygent_harness.core.task import TaskNotification
-from raygent_harness.core.tool import Tool, ToolRuntimeContext, ToolUseContext
+from raygent_harness.core.tool import (
+    Tool,
+    ToolRuntimeContext,
+    ToolUseContext,
+)
+from raygent_harness.core.tool import (
+    tool_visible_to_model as _tool_visible_to_model,
+)
 from raygent_harness.core.tool_execution import ToolExecutionProgress, ToolExecutionResult
 from raygent_harness.core.tool_orchestration import (
     ToolOrchestrationOutcome,
@@ -276,6 +291,7 @@ class ToolOrchestrationComplete:
 
     type: Literal["tool_orchestration_complete"] = "tool_orchestration_complete"
     tool_result_messages: tuple[MessageParam, ...] = ()
+    discovered_tool_names: frozenset[str] = frozenset()
     permission_denials: tuple[PermissionDenial, ...] = ()
     updated_context: ToolUseContext | None = None
     should_prevent_continuation: bool = False
@@ -1951,6 +1967,7 @@ def _streaming_tool_orchestration_complete(
 ) -> ToolOrchestrationComplete:
     return ToolOrchestrationComplete(
         tool_result_messages=executor.tool_result_messages,
+        discovered_tool_names=executor.discovered_tool_names,
         permission_denials=executor.permission_denials,
         updated_context=executor.updated_context,
         should_prevent_continuation=executor.should_prevent_continuation,
@@ -2081,6 +2098,7 @@ async def _orchestrate_tools(
 
     yield ToolOrchestrationComplete(
         tool_result_messages=outcome.tool_result_messages,
+        discovered_tool_names=outcome.discovered_tool_names,
         permission_denials=outcome.permission_denials,
         updated_context=outcome.updated_context,
         should_prevent_continuation=outcome.should_prevent_continuation,
@@ -2762,7 +2780,16 @@ async def query(
          COMPACTED view + new history, AND reset the error watermark here
          since we made clean progress) or yield TerminalEvent and return.
     """
-    state: State = initial_state
+    state: State = replace(
+        initial_state,
+        discovered_tool_names=frozenset(
+            {*initial_state.discovered_tool_names, *ctx.discovered_tool_names}
+        ),
+    )
+    ctx = cast(  # pyright: ignore[reportUnnecessaryCast]
+        ToolUseContext,
+        replace(ctx, discovered_tool_names=state.discovered_tool_names),
+    )
 
     # Turn-entry: budget + max-turns pre-check. These are cheap enough to run
     # before the first model call, and short-circuit the pathological case
@@ -3125,9 +3152,7 @@ async def query(
                 raise RuntimeError("tool orchestration completed without outcome")
             if orchestration_complete.updated_context is not None:
                 ctx = cast(ToolUseContext, orchestration_complete.updated_context)
-            discovered_after_tools = _selected_tool_names_from_messages(
-                orchestration_complete.tool_result_messages
-            )
+            discovered_after_tools = orchestration_complete.discovered_tool_names
             if discovered_after_tools:
                 ctx = cast(  # pyright: ignore[reportUnnecessaryCast]
                     ToolUseContext,
@@ -3150,6 +3175,7 @@ async def query(
                     *state.permission_denials,
                     *orchestration_complete.permission_denials,
                 ),
+                discovered_tool_names=ctx.discovered_tool_names,
             )
 
             if orchestration_complete.aborted or ctx.abort_event.is_set():
@@ -3305,13 +3331,9 @@ async def _build_model_tool_specs(
     ctx: ToolUseContext,
 ) -> list[ModelToolSpec]:
     """Build provider-neutral schemas for currently model-visible tools."""
-    selected_deferred_tool_names = {
-        *ctx.discovered_tool_names,
-        *_selected_tool_names_from_messages(ctx.messages),
-    }
     specs: list[ModelToolSpec] = []
     for tool in tools:
-        if not tool_visible_to_model(tool, selected_deferred_tool_names):
+        if not tool_visible_to_model(tool, ctx.discovered_tool_names):
             continue
         try:
             description = await tool.prompt(ctx)
@@ -3349,25 +3371,17 @@ def _rules_to_json(rules: Mapping[Any, Sequence[str]]) -> dict[str, FrozenJson]:
     return {str(source): tuple(values) for source, values in rules.items()}
 
 
-def tool_visible_to_model(tool: Tool, selected_tool_names: set[str] | None = None) -> bool:
+def tool_visible_to_model(
+    tool: Tool,
+    selected_tool_names: Collection[str] | None = None,
+) -> bool:
     """Model request visibility gate.
 
     Disabled tools and deferred tools are not sent to the model unless the tool
-    explicitly opts into `always_load` or a prior ToolSearch result selected
-    them. Raygent parses prior tool-reference result blocks to emulate the
-    reference's client-side schema expansion path.
+    explicitly opts into `always_load` or trusted runtime discovery state shows
+    an engine-owned ToolSearch result selected them.
     """
-    try:
-        if not tool.is_enabled():
-            return False
-    except Exception:
-        return False
-    if selected_tool_names and (
-        tool.name in selected_tool_names
-        or any(alias in selected_tool_names for alias in tool.aliases)
-    ):
-        return True
-    return tool.always_load or not tool.should_defer
+    return _tool_visible_to_model(tool, selected_tool_names)
 
 
 def selected_tool_names_from_messages(messages: Sequence[MessageParam]) -> set[str]:
@@ -3376,11 +3390,6 @@ def selected_tool_names_from_messages(messages: Sequence[MessageParam]) -> set[s
     )
 
     return _selected_tool_names_from_messages_impl(messages)
-
-
-def _selected_tool_names_from_messages(messages: Sequence[MessageParam]) -> set[str]:
-    """Backward-compatible private alias for older internal tests/helpers."""
-    return selected_tool_names_from_messages(messages)
 
 
 def _extract_assistant_message(response: Any) -> MessageParam:

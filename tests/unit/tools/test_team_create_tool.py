@@ -57,7 +57,14 @@ def _base_tool(name: str) -> Tool:
     )
 
 
-def _ctx(*, tools: Sequence[Tool] = (), agent_id: str | None = None) -> ToolUseContext:
+def _ctx(
+    *,
+    tools: Sequence[Tool] = (),
+    agent_id: str | None = None,
+    discovered: Sequence[str] | None = None,
+) -> ToolUseContext:
+    if discovered is None:
+        discovered = (TEAM_CREATE_TOOL_NAME,)
     return ToolUseContext(
         session_id="s",
         agent_id=agent_id,
@@ -66,6 +73,7 @@ def _ctx(*, tools: Sequence[Tool] = (), agent_id: str | None = None) -> ToolUseC
         cwd="/repo",
         tools=tuple(tools),
         query_tracking=QueryTracking(chain_id="c", depth=0),
+        discovered_tool_names=frozenset(discovered),
     )
 
 

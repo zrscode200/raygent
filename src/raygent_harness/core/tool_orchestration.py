@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from raygent_harness.core.model_adapter import ToolUseBlock
 from raygent_harness.core.observability import KernelEventContext
 from raygent_harness.core.state import PermissionDenial
-from raygent_harness.core.tool import find_tool_by_name
+from raygent_harness.core.tool import find_tool_by_name, tool_visible_to_model
 from raygent_harness.core.tool_execution import (
     ToolExecutionEvent,
     ToolExecutionProgress,
@@ -51,6 +51,7 @@ class ToolOrchestrationOutcome:
 
     type: Literal["outcome"] = "outcome"
     tool_result_messages: tuple[MessageParam, ...] = ()
+    discovered_tool_names: frozenset[str] = frozenset()
     permission_denials: tuple[PermissionDenial, ...] = ()
     updated_context: ToolUseContext | None = None
     should_prevent_continuation: bool = False
@@ -67,6 +68,7 @@ ToolOrchestrationEvent = (
 def partition_tool_calls(
     tool_uses: Sequence[ToolUseBlock],
     tools: Sequence[Tool],
+    ctx: ToolUseContext,
 ) -> tuple[ToolBatch, ...]:
     """Partition tool calls into serial unsafe calls and safe adjacent batches.
 
@@ -76,7 +78,7 @@ def partition_tool_calls(
     batches: list[ToolBatch] = []
 
     for tool_use in tool_uses:
-        is_safe = _is_concurrency_safe(tool_use, tools)
+        is_safe = _is_concurrency_safe(tool_use, tools, ctx)
         if is_safe and batches and batches[-1].is_concurrency_safe:
             previous = batches[-1]
             batches[-1] = ToolBatch(
@@ -112,7 +114,8 @@ async def run_tools(
     prevent_reason: str | None = None
     safe_max_concurrency = max(1, max_concurrency)
     completed_tool_use_ids: set[str] = set()
-    batches = partition_tool_calls(tool_uses, tools)
+    discovered_tool_names: set[str] = set()
+    batches = partition_tool_calls(tool_uses, tools, ctx)
 
     _emit_tool_batch_event(
         deps,
@@ -160,6 +163,7 @@ async def run_tools(
 
                     flattened_messages = _messages_from_result(event)
                     result_messages.extend(flattened_messages)
+                    discovered_tool_names.update(event.discovered_tool_names)
                     completed_tool_use_ids.update(_tool_result_ids(flattened_messages))
                     permission_denials.extend(event.permission_denials)
                     should_prevent_continuation = (
@@ -186,6 +190,7 @@ async def run_tools(
 
                         flattened_messages = _messages_from_result(event)
                         result_messages.extend(flattened_messages)
+                        discovered_tool_names.update(event.discovered_tool_names)
                         completed_tool_use_ids.update(_tool_result_ids(flattened_messages))
                         permission_denials.extend(event.permission_denials)
                         should_prevent_continuation = (
@@ -213,6 +218,7 @@ async def run_tools(
             yield result
         outcome = ToolOrchestrationOutcome(
             tool_result_messages=tuple(result_messages),
+            discovered_tool_names=frozenset(discovered_tool_names),
             permission_denials=tuple(permission_denials),
             updated_context=current_context,
             should_prevent_continuation=should_prevent_continuation,
@@ -239,6 +245,7 @@ async def run_tools(
 
     outcome = ToolOrchestrationOutcome(
         tool_result_messages=tuple(result_messages),
+        discovered_tool_names=frozenset(discovered_tool_names),
         permission_denials=tuple(permission_denials),
         updated_context=current_context,
         should_prevent_continuation=should_prevent_continuation,
@@ -366,9 +373,12 @@ async def _run_concurrent_batch(
 def _is_concurrency_safe(
     tool_use: ToolUseBlock,
     tools: Sequence[Tool],
+    ctx: ToolUseContext,
 ) -> bool:
     tool = find_tool_by_name(tools, tool_use.name)
     if tool is None:
+        return False
+    if not tool_visible_to_model(tool, ctx.discovered_tool_names):
         return False
 
     try:

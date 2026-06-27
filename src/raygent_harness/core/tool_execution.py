@@ -26,6 +26,7 @@ from raygent_harness.core.tool import (
     ToolProgress,
     ToolResult,
     find_tool_by_name,
+    tool_visible_to_model,
 )
 from raygent_harness.core.tool import (
     ValidationError as ToolValidationError,
@@ -84,12 +85,34 @@ class ToolExecutionResult:
     additional_messages: tuple[MessageParam, ...] = ()
     """Tool-provided `newMessages` emitted after the tool_result message."""
 
+    discovered_tool_names: tuple[str, ...] = ()
+    """Deferred tools selected by the primary ToolSearch result."""
+
     context_modifier: ToolContextModifier | None = None
     should_prevent_continuation: bool = False
     prevent_reason: str | None = None
 
 
 ToolExecutionEvent = ToolExecutionProgress | ToolExecutionResult
+
+
+def deferred_tool_not_selected_result(
+    *,
+    tool_use_id: str,
+    tool_name: str,
+) -> ToolExecutionResult:
+    """Model-visible error for raw calls to hidden deferred tools."""
+
+    return _result(
+        tool_use_id,
+        _tool_error(
+            f"Error: Tool {tool_name} is deferred and must be selected with "
+            "ToolSearch before it can be used."
+        ),
+        is_error=True,
+        tool_name=tool_name,
+        status="unknown_tool",
+    )
 
 
 async def run_tool_use(
@@ -126,6 +149,24 @@ async def run_tool_use(
             is_error=True,
             tool_name=tool_use.name,
             status="unknown_tool",
+        )
+        return
+    if not tool_visible_to_model(tool, ctx.discovered_tool_names):
+        _emit_tool_event(
+            deps,
+            ctx,
+            "tool.call.failed",
+            tool_use_id=tool_use.id,
+            data=_tool_call_payload(
+                tool_use=tool_use,
+                tool=tool,
+                stage="lookup",
+                failure_reason="deferred_tool_not_selected",
+            ),
+        )
+        yield deferred_tool_not_selected_result(
+            tool_use_id=tool_use.id,
+            tool_name=tool_use.name,
         )
         return
     execution_ctx = replace(
@@ -490,6 +531,10 @@ async def run_tool_use(
                     status="failed" if event.is_error else "completed",
                     pre_messages=hook_outcome.additional_messages,
                     additional_messages=additional_messages,
+                    discovered_tool_names=_trusted_discovered_tool_names(
+                        tool.name,
+                        event,
+                    ),
                     context_modifier=event.context_modifier,
                     should_prevent_continuation=hook_outcome.should_prevent_continuation,
                     prevent_reason=hook_outcome.stop_reason,
@@ -875,6 +920,15 @@ def _result(
         should_prevent_continuation=should_prevent_continuation,
         prevent_reason=prevent_reason,
     )
+
+
+def _trusted_discovered_tool_names(
+    tool_name: str,
+    result: ToolResult,
+) -> tuple[str, ...]:
+    if tool_name != "ToolSearch" or result.is_error:
+        return ()
+    return tuple(name for name in result.discovered_tool_names if name)
 
 
 def _tool_result_message(

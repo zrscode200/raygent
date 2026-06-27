@@ -8,7 +8,7 @@ embedders can inspect what a preset enables before constructing a session.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -233,7 +233,7 @@ _DESCRIPTIONS: Mapping[RaygentPreset, RaygentPresetDescription] = MappingProxyTy
         "full_developer": RaygentPresetDescription(
             name="full_developer",
             summary="Broad developer capability bundle with explicit safety acknowledgement.",
-            tool_policy='tools="project" with optional Bash enablement',
+            tool_policy='tools="project" plus Bash after explicit acknowledgements',
             context_policy='context="project"',
             capabilities=(
                 "project_tools",
@@ -359,8 +359,11 @@ def resolve_raygent_preset(
         if overlay_result.requires_explicit_permission_options:
             requires_explicit_permission_options = True
 
-    if not tool_names:
-        tool_names = _tool_names_from_policy(factory_kwargs.get("tools"))
+    final_tools = factory_kwargs.get("tools")
+    enable_bash = enable_bash and final_tools == "project"
+    tool_names = _tool_names_from_policy(final_tools)
+    if enable_bash:
+        tool_names = _dedupe((*tool_names, "Bash"))
 
     return RaygentPresetResolution(
         preset=resolved_preset,
@@ -588,7 +591,7 @@ def _tool_names_from_policy(value: object) -> tuple[str, ...]:
     return ()
 
 
-def _dedupe(values: list[str]) -> tuple[str, ...]:
+def _dedupe(values: Iterable[str]) -> tuple[str, ...]:
     seen: set[str] = set()
     result: list[str] = []
     for value in values:

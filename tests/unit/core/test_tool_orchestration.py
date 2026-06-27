@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from raygent_harness.core.deps import QueryDeps
 from raygent_harness.core.model_adapter import ToolUseBlock
@@ -96,6 +96,53 @@ def _content(result: ToolExecutionResult) -> str:
     return cast(str, block["content"])
 
 
+def test_hidden_deferred_partition_does_not_parse_or_evaluate_predicate() -> None:
+    parse_seen: list[Any] = []
+    predicate_seen: list[BaseModel] = []
+
+    class CountingInput(BaseModel):
+        parsed: ClassVar[list[Any]] = parse_seen
+
+        @model_validator(mode="before")
+        @classmethod
+        def count_parse(cls, data: Any) -> Any:
+            cls.parsed.append(data)
+            return data
+
+    async def call(
+        _input: BaseModel,
+        _ctx: ToolUseContext,
+    ) -> AsyncIterator[ToolCallEvent]:
+        yield ToolResult(content="ok")
+
+    def concurrency_safe(input_: BaseModel) -> bool:
+        predicate_seen.append(input_)
+        return True
+
+    tool = build_tool(
+        ToolSpec(
+            name="Deferred",
+            description="deferred",
+            input_model=CountingInput,
+            call=call,
+            is_concurrency_safe=concurrency_safe,
+            should_defer=True,
+        )
+    )
+
+    batches = partition_tool_calls(
+        (_tool_use("Deferred", "tu_deferred"),),
+        (tool,),
+        _ctx(),
+    )
+
+    assert [(batch.is_concurrency_safe, len(batch.blocks)) for batch in batches] == [
+        (False, 1),
+    ]
+    assert parse_seen == []
+    assert predicate_seen == []
+
+
 @pytest.mark.asyncio
 async def test_partition_treats_invalid_missing_and_throwing_predicates_as_unsafe() -> None:
     class RequiredInput(BaseModel):
@@ -137,6 +184,7 @@ async def test_partition_treats_invalid_missing_and_throwing_predicates_as_unsaf
             _tool_use("Throwing", "tu_throwing"),
         ),
         (safe, strict, throwing),
+        _ctx(),
     )
 
     assert [(batch.is_concurrency_safe, len(batch.blocks)) for batch in batches] == [

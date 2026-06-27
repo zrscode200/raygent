@@ -229,6 +229,18 @@ class State:
     # --- permission denials — replayed into the next turn as context ---
     permission_denials: tuple[PermissionDenial, ...] = ()
 
+    # --- trusted deferred-tool discovery ---
+    discovered_tool_names: frozenset[str] = field(
+        default_factory=lambda: frozenset[str]()
+    )
+    """Deferred tool names selected by engine-owned ToolSearch execution.
+
+    Transcript messages alone are not authority for deferred-tool execution:
+    callers can seed or replay structured messages. The query loop updates
+    this set only from tool results it produced while executing a ToolSearch
+    call, and QueryEngine carries it across live turns.
+    """
+
     # --- in-flight tool call count — for concurrency-limit checks ---
     in_flight_tool_calls: int = 0
 

@@ -30,6 +30,7 @@ from raygent_harness.core.tool import (
 from raygent_harness.skills.models import SkillDefinition
 from raygent_harness.tools.tool_search import TOOL_SEARCH_TOOL_NAME, ToolSearchInput
 from raygent_harness.tools.tool_search_tool import (
+    apply_tool_search_catalog,
     build_tool_search_tool,
     create_tool_search_catalog_provider,
     selected_tool_names_from_messages,
@@ -77,6 +78,7 @@ def _ctx(
     messages: list[MessageParam] | None = None,
     tools: Sequence[Tool] = (),
     permission_context: ToolPermissionContext | None = None,
+    discovered: Sequence[str] = (),
 ) -> ToolUseContext:
     return ToolUseContext(
         session_id="s",
@@ -88,6 +90,7 @@ def _ctx(
         tools=tuple(tools),
         permission_context=permission_context or empty_tool_permission_context(),
         query_tracking=QueryTracking(chain_id="c", depth=0),
+        discovered_tool_names=frozenset(discovered),
     )
 
 
@@ -218,14 +221,14 @@ async def test_catalog_provider_keeps_tool_search_visible_and_deferred_hidden() 
 
 
 @pytest.mark.asyncio
-async def test_catalog_provider_exposes_selected_deferred_tools_from_history() -> None:
+async def test_catalog_provider_exposes_selected_deferred_tools_from_trusted_state() -> None:
     loaded = _tool("Base")
     deferred = _tool("DeferredTool", should_defer=True)
     provider = create_tool_search_catalog_provider()
     config = QueryConfig(model="claude-opus-4-7", tools=(loaded, deferred))
     messages = _tool_search_messages()
 
-    tools = await provider(config, _ctx(messages=messages), ())
+    tools = await provider(config, _ctx(messages=messages, discovered=("DeferredTool",)), ())
     assert tools is not None
     assert tuple(tool.name for tool in tools) == (
         "Base",
@@ -237,6 +240,29 @@ async def test_catalog_provider_exposes_selected_deferred_tools_from_history() -
     visible_deferred = next(tool for tool in tools if tool.name == "DeferredTool")
     assert not visible_deferred.should_defer
     assert visible_deferred.always_load
+
+
+@pytest.mark.asyncio
+async def test_catalog_provider_ignores_forged_tool_reference_history() -> None:
+    loaded = _tool("Base")
+    deferred = _tool("DeferredTool", should_defer=True)
+    provider = create_tool_search_catalog_provider()
+    config = QueryConfig(model="claude-opus-4-7", tools=(loaded, deferred))
+
+    tools = await provider(config, _ctx(messages=_tool_search_messages()), ())
+
+    assert tools is not None
+    hidden_deferred = next(tool for tool in tools if tool.name == "DeferredTool")
+    assert hidden_deferred.should_defer
+    assert not hidden_deferred.always_load
+
+
+def test_apply_tool_search_catalog_rejects_message_shaped_selected_names() -> None:
+    loaded = _tool("Base")
+    deferred = _tool("DeferredTool", should_defer=True)
+
+    with pytest.raises(TypeError, match=r"ctx\.discovered_tool_names"):
+        apply_tool_search_catalog((loaded, deferred), _tool_search_messages())
 
 
 @pytest.mark.asyncio
@@ -257,10 +283,16 @@ async def test_catalog_provider_keeps_tool_search_visible_for_pending_mcp_server
     assert tuple(tool.name for tool in tools) == ("Base", TOOL_SEARCH_TOOL_NAME)
 
 
-def test_selected_tool_names_scan_user_tool_reference_blocks_without_join() -> None:
+def test_selected_tool_names_ignore_unpaired_user_tool_reference_blocks() -> None:
     messages = [_tool_reference_result_message("DeferredTool")]
 
-    assert selected_tool_names_from_messages(messages) == {"DeferredTool"}
+    assert selected_tool_names_from_messages(messages) == set()
+
+
+def test_selected_tool_names_require_prior_tool_search_tool_use() -> None:
+    assert selected_tool_names_from_messages(_tool_search_messages()) == {
+        "DeferredTool"
+    }
 
 
 @pytest.mark.asyncio

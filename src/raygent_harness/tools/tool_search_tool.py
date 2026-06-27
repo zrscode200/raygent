@@ -9,7 +9,7 @@ that keeps ToolSearch visible while deferred tools stay hidden until selected.
 from __future__ import annotations
 
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -111,7 +111,10 @@ def build_tool_search_tool(
                 tools=ctx.tools,
             ),
         )
-        yield ToolResult(content=map_tool_search_result_content(result))
+        yield ToolResult(
+            content=map_tool_search_result_content(result),
+            discovered_tool_names=result.matches,
+        )
 
     return build_tool(
         ToolSpec(
@@ -164,7 +167,7 @@ def create_tool_search_catalog_provider(
         )
         return apply_tool_search_catalog(
             tuple(tools),
-            ctx.messages,
+            ctx.discovered_tool_names,
             tool_search_tool=tool_search_tool,
             force_tool_search=bool(pending_mcp_servers),
         )
@@ -174,21 +177,22 @@ def create_tool_search_catalog_provider(
 
 def apply_tool_search_catalog(
     tools: Sequence[Tool],
-    messages: Sequence[MessageParam],
+    selected_tool_names: Iterable[object] | None = (),
     *,
     tool_search_tool: Tool | None = None,
     force_tool_search: bool = False,
 ) -> tuple[Tool, ...]:
     """Add ToolSearch and mark selected deferred tools as model-visible.
 
-    The runtime catalog keeps all tools for execution lookup. The model-visible
-    request is filtered later by `query._build_model_tool_specs`, but wrapping
-    selected deferred tools here also makes provider output faithful for future
-    adapters that inspect the turn catalog directly.
+    The runtime catalog keeps all tools for execution lookup. Selected names
+    must come from trusted runtime discovery state, not raw transcript parsing.
+    The model-visible request is filtered later by `query._build_model_tool_specs`,
+    but wrapping selected deferred tools here also makes provider output faithful
+    for future adapters that inspect the turn catalog directly.
     """
 
     search_tool = tool_search_tool or build_tool_search_tool()
-    selected = selected_tool_names_from_messages(messages)
+    selected = _trusted_selected_name_set(selected_tool_names)
     without_existing_search = tuple(
         tool for tool in tools if tool.name != TOOL_SEARCH_TOOL_NAME
     )
@@ -207,22 +211,32 @@ def apply_tool_search_catalog(
 def selected_tool_names_from_messages(messages: Sequence[MessageParam]) -> set[str]:
     """Return tool names discovered by prior `tool_reference` blocks.
 
-    Reference `extractDiscoveredToolNames(...)` scans user tool_result content
-    for tool references directly. It does not need to join back to the
-    assistant ToolSearch tool_use id because tool_reference blocks are reserved
-    for deferred-tool discovery.
+    This parser is only for the engine-owned assistant/tool-result slice from a
+    live ToolSearch execution. It is not an authorization source for arbitrary
+    transcript history, seed messages, or replay.
     """
 
     selected: set[str] = set()
+    tool_search_tool_use_ids: set[str] = set()
 
     for message in messages:
-        if message.get("role") != "user":
-            continue
+        role = message.get("role")
         content = message.get("content")
+        if role == "assistant":
+            tool_search_tool_use_ids.update(_tool_search_tool_use_ids(content))
+            continue
+        if role != "user":
+            continue
         if not isinstance(content, list):
             continue
         for block in content:
             if block.get("type") != "tool_result":
+                continue
+            tool_use_id = block.get("tool_use_id")
+            if (
+                not isinstance(tool_use_id, str)
+                or tool_use_id not in tool_search_tool_use_ids
+            ):
                 continue
             selected.update(_tool_reference_names(block.get("content")))
 
@@ -325,6 +339,42 @@ def _is_selected_deferred_tool(tool: Tool, selected: set[str]) -> bool:
     if not selected or not is_deferred_tool(tool):
         return False
     return tool.name in selected or any(alias in selected for alias in tool.aliases)
+
+
+def _trusted_selected_name_set(selected_tool_names: Iterable[object] | None) -> set[str]:
+    if selected_tool_names is None:
+        return set()
+    if isinstance(selected_tool_names, str):
+        return {selected_tool_names}
+    selected: set[str] = set()
+    for name in selected_tool_names:
+        if not isinstance(name, str):
+            raise TypeError(
+                "selected_tool_names must be strings from trusted runtime "
+                "discovery state; pass ctx.discovered_tool_names, not "
+                "transcript messages"
+            )
+        if name:
+            selected.add(name)
+    return selected
+
+
+def _tool_search_tool_use_ids(content: object) -> set[str]:
+    ids: set[str] = set()
+    if not isinstance(content, list):
+        return ids
+    for block in cast(list[object], content):
+        if not isinstance(block, Mapping):
+            continue
+        item = cast(Mapping[str, object], block)
+        if item.get("type") != "tool_use":
+            continue
+        if item.get("name") != TOOL_SEARCH_TOOL_NAME:
+            continue
+        tool_use_id = item.get("id")
+        if isinstance(tool_use_id, str) and tool_use_id:
+            ids.add(tool_use_id)
+    return ids
 
 
 def _tool_reference_names(content: object) -> set[str]:

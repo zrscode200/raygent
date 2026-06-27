@@ -85,7 +85,6 @@ from raygent_harness.core.query import (
     Terminal,
     TerminalReason,
     query,
-    selected_tool_names_from_messages,
     tool_visible_to_model,
 )
 from raygent_harness.core.query import (
@@ -428,9 +427,9 @@ class QueryEngine:
     ) -> QueryEngine:
         """Construct a QueryEngine from a loaded transcript replay.
 
-        Rebuilds API-visible messages, compact boundaries, content-replacement
-        cache state, and deferred-tool discovery. Usage totals and product UI
-        metadata intentionally remain outside replay scope.
+        Rebuilds API-visible messages, compact boundaries, and content-replacement
+        cache state. Deferred-tool discovery is trusted runtime state and is not
+        reconstructed from raw replay messages.
         """
 
         scope = transcript_scope or TranscriptScope(
@@ -457,7 +456,6 @@ class QueryEngine:
         engine._messages = list(replay.messages)
         engine._compact_boundaries = replay.compact_boundaries
         engine._transcript_parent_entry_id = replay.last_message_entry_id
-        engine._track_discovered_tool_names(*engine._messages)
         engine._emit_transcript_observability(
             "transcript.replay.completed",
             {
@@ -613,6 +611,7 @@ class QueryEngine:
             messages=list(self._messages),
             compact_boundaries=self._compact_boundaries,
             permission_denials=tuple(self._permission_denials),
+            discovered_tool_names=frozenset(self._discovered_tool_names),
         )
         terminal: Terminal | None = None
         final_turn_count = state.iteration
@@ -1611,7 +1610,6 @@ class QueryEngine:
         """Single site where the conversation log grows. Future: transcript
         recording, crash-recovery write-ahead log, observability hooks."""
         self._messages.append(msg)
-        self._track_discovered_tool_names(msg)
 
     async def _record_transcript_message(self, msg: MessageParam) -> None:
         store = self._deps.transcript_store
@@ -1858,7 +1856,7 @@ class QueryEngine:
         self._compact_boundaries = terminal.final_state.compact_boundaries
         self._permission_denials = list(terminal.final_state.permission_denials)
         self._track_usage(terminal.final_state.usage)
-        self._track_discovered_tool_names(*terminal.final_state.messages)
+        self._discovered_tool_names = set(terminal.final_state.discovered_tool_names)
 
     def _track_usage(self, delta: UsageTotals) -> None:
         """Single site for usage accumulation. Future: budget enforcement
@@ -1881,13 +1879,6 @@ class QueryEngine:
         """Single site for recording denials. Future: replay into next turn's
         context via the context pipeline."""
         self._permission_denials.append(denial)
-
-    def _track_discovered_tool_names(self, *messages: MessageParam) -> None:
-        from raygent_harness.tools.tool_search_tool import (
-            selected_tool_names_from_messages,
-        )
-
-        self._discovered_tool_names.update(selected_tool_names_from_messages(messages))
 
     def _observability_context(
         self,
@@ -2357,28 +2348,22 @@ def _message_content_to_text(content: object) -> str:
 
 
 def _agent_delegation_tool_available(config: QueryConfig, ctx: ToolUseContext) -> bool:
-    selected_deferred_tool_names = {
-        *ctx.discovered_tool_names,
-        *selected_tool_names_from_messages(ctx.messages),
-    }
     for tool in config.tools:
         is_delegation_tool = tool.name in {"Agent", "Task"} or any(
             alias in {"Agent", "Task"} for alias in tool.aliases
         )
         if not is_delegation_tool:
             continue
-        if tool_visible_to_model(tool, selected_deferred_tool_names):
+        if tool_visible_to_model(tool, ctx.discovered_tool_names):
             return True
     return False
 
 
 def _coerce_user_message(prompt: str | MessageParam) -> MessageParam:
-    """String prompts become `{role: 'user', content: str}`. Otherwise pass
-    through. Keeps the public API ergonomic without losing the structured path.
-    """
+    """Coerce public prompts to user-role messages."""
     if isinstance(prompt, str):
         return {"role": "user", "content": prompt}
-    return prompt
+    return cast("MessageParam", {**prompt, "role": "user"})
 
 
 def _default_transcript_scope(

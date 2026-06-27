@@ -26,6 +26,17 @@ REQUIRED_PRESETS = (
     "full_developer",
 )
 
+PROJECT_TOOL_NAMES = (
+    "Read",
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "Glob",
+    "Grep",
+    "TaskStop",
+    "ToolSearch",
+)
+
 
 def test_lists_required_presets_in_documentation_order() -> None:
     assert list_raygent_presets() == REQUIRED_PRESETS
@@ -110,6 +121,32 @@ def test_repo_maintainer_resolves_to_project_tools_after_acknowledgement() -> No
     assert resolved.requires_explicit_permission_options is True
 
 
+def test_bash_overlay_resolves_to_project_tool_catalog_plus_bash() -> None:
+    resolved = resolve_raygent_preset(
+        "minimal",
+        overlays=("bash",),
+        options=RaygentPresetOptions(allow_shell=True),
+    )
+
+    assert resolved.factory_kwargs["tools"] == "project"
+    assert resolved.enable_bash is True
+    assert resolved.tool_names == (*PROJECT_TOOL_NAMES, "Bash")
+    assert resolved.requires_explicit_permission_options is True
+
+
+def test_later_readonly_tools_overlay_removes_bash_from_final_catalog() -> None:
+    resolved = resolve_raygent_preset(
+        "minimal",
+        overlays=("bash", "readonly_tools"),
+        options=RaygentPresetOptions(allow_shell=True),
+    )
+
+    assert resolved.factory_kwargs["tools"] != "project"
+    assert resolved.enable_bash is False
+    assert resolved.tool_names == ("Read", "Glob", "Grep", "ToolSearch")
+    assert "Bash" not in resolved.tool_names
+
+
 def test_long_running_task_resolves_to_durable_persistence(tmp_path: Path) -> None:
     resolved = resolve_raygent_preset(
         "long_running_task",
@@ -159,10 +196,17 @@ def test_full_developer_requires_explicit_permission_options_after_acknowledgeme
 
     assert resolved.factory_kwargs["tools"] == "project"
     assert resolved.enable_bash is True
+    assert resolved.tool_names == (*PROJECT_TOOL_NAMES, "Bash")
     assert resolved.requires_explicit_permission_options is True
     assert "permission_options or explicit permission handler/context" in (
         resolved.required_options
     )
+
+
+def test_full_developer_description_names_included_bash_authority() -> None:
+    description = describe_raygent_preset("full_developer")
+
+    assert 'tools="project" plus Bash' in description.tool_policy
 
 
 def test_incompatible_overlay_combinations_raise_structured_error() -> None:

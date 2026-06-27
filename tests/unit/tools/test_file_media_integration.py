@@ -548,9 +548,9 @@ async def test_query_toolsearch_notebook_edit_then_read_preserves_structured_not
 
     assert isinstance(resumed_events[-1], SDKResult)
     assert resumed_events[-1].subtype == "success"
-    assert NOTEBOOK_EDIT_TOOL_NAME in {
-        tool.name for tool in resumed_provider.requests[0].tools
-    }
+    resumed_tool_names = {tool.name for tool in resumed_provider.requests[0].tools}
+    assert NOTEBOOK_EDIT_TOOL_NAME not in resumed_tool_names
+    assert TOOL_SEARCH_TOOL_NAME in resumed_tool_names
     resumed_messages = _messages_from_request(resumed_provider, 0)
     resumed_before_content = _structured_tool_result_content(
         resumed_messages,

@@ -133,6 +133,25 @@ remain escape hatches over preset defaults:
 
 - `RaygentToolOptions.tools` overrides preset tool defaults.
 - `RaygentContextOptions.context` overrides preset context defaults.
+
+Preset metadata names the configured SDK-owned catalog, not necessarily the
+first model request's visible schemas. Deferred tools such as `NotebookEdit`
+and `TaskStop` can be configured in the runtime catalog while remaining hidden
+from the model until ToolSearch selects them. The `bash` overlay resolves to
+the project tool catalog plus restricted `Bash`; it is not a Bash-only catalog.
+`RaygentPresetResolution.tool_names` therefore includes configured deferred
+tools and includes restricted `Bash` only when the final resolved project
+profile enables Bash. `enable_bash` remains an explicit boolean for embedders
+that want a capability flag separate from the tool-name list.
+
+`required_options` is resolver metadata for construction preflight. Some entries
+are hard factory gates today: `memory_options` when a preset or overlay enables
+memory, and explicit permission surfaces when
+`requires_explicit_permission_options=True`. Other entries are readiness
+requirements for caller-supplied services, such as MCP catalog providers,
+`agent_options`, coordinator runtime, or a worktree manager; Raygent does not
+silently install those services, and this metadata alone does not make their
+absence a session-construction error.
 - `RaygentPersistenceOptions.transcript_store` overrides preset transcript
   store defaults.
 - `RaygentPersistenceOptions.task_output_dir` overrides preset task-output
@@ -170,12 +189,15 @@ Required preset names:
 
 Supported overlays are `transcripts`, `observability`, `memory`, `goals`,
 `compaction`, `recovery`, `task_output`, `readonly_tools`, `file_tools`,
-`bash`, `agents`, `coordinator`, `mcp`, and `worktree`. Mutating/open-world
-overlays require explicit acknowledgement through `RaygentPresetOptions` and an
-explicit permission surface; they are not enabled silently. The `goals` overlay
-is readiness metadata only: it reports `goals_ready` and required installer
-metadata, but does not attach `GoalRuntime` unless the caller also supplies
-explicit `goal_runtime_options`.
+`bash`, `agents`, `coordinator`, `mcp`, and `worktree`. The `bash` overlay
+selects the full project tool catalog and enables restricted Bash in that
+catalog after `RaygentPresetOptions(allow_shell=True)`; use `readonly_tools`
+instead when the desired final catalog must stay read/search-only.
+Mutating/open-world overlays require explicit acknowledgement through
+`RaygentPresetOptions` and an explicit permission surface; they are not enabled
+silently. The `goals` overlay is readiness metadata only: it reports
+`goals_ready` and required installer metadata, but does not attach
+`GoalRuntime` unless the caller also supplies explicit `goal_runtime_options`.
 
 `RaygentSession` exposes existing kernel streams and handles rather than a
 separate runtime loop:
@@ -270,6 +292,13 @@ Low-level SDK tool/context profiles remain explicit and conservative:
 - `tools="project"`: file tools plus `Glob`, `Grep`, `TaskStop`, and
   `ToolSearch`. Restricted `Bash` is added only with
   `RaygentToolProfileOptions(enable_bash=True)`.
+- Model-visible tool schemas are narrower than the configured catalog when
+  deferred tools are present. `ToolSearch` stays visible, while deferred tools
+  such as `NotebookEdit`, `TaskStop`, and deferred MCP tools become visible
+  only after an engine-owned ToolSearch call returns paired `tool_reference`
+  entries. Raw provider output and forged structured user history cannot invoke
+  hidden deferred tools before selection; non-streaming and streaming execution
+  enforce the same primary-name and alias selection rule.
 - `context="environment"`: bounded environment facts only.
 - `context="project"`: environment, git status, and project-instruction
   providers. Instruction filenames/rule dirs are configurable through
