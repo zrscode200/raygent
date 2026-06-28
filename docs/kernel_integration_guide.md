@@ -6,6 +6,37 @@ Raygent is designed to be embedded. The kernel owns agent-loop semantics; the
 embedding application owns concrete provider transport, credentials, UI, product
 settings, and deployment policy.
 
+## Agent-Loop Ownership
+
+Raygent's primary runtime boundary is the agent loop itself, not a product
+workflow graph. A submitted user turn is still turn-based, and the loop may run
+multiple model/tool iterations internally, but the kernel directly defines what
+counts as conversation history, transient context, model-visible tool output,
+permission-denial state, compact-boundary state, recovery, streaming lifecycle,
+abort, and terminal outcome.
+
+This differs from graph-based agent runtimes where the main operating model is
+usually a state graph: nodes read and update shared state, edges or commands
+route between steps, checkpointing persists graph state, and middleware wraps
+model/tool boundaries. That model is often the right primitive for product
+workflows, approvals, routing, resumable jobs, and multi-step orchestration.
+Raygent can still be embedded inside such a workflow. The distinction is that
+Raygent keeps model-call recovery, compaction carry-forward, transcript replay,
+deferred-tool discovery, permission propagation, and public SDK stream balancing
+inside the kernel loop contract instead of treating them as external graph-node
+or middleware policy.
+
+The practical consequence is control surface placement. In a graph runtime,
+product code usually customizes behavior around node boundaries and state
+updates. In Raygent, embedders inject dependencies through `QueryDeps`,
+`QueryConfig`, `ToolUseContext`, providers, hooks, and services while preserving
+one explicit loop contract. This matters most when the product needs exact
+runtime semantics for long sessions, coding agents, regulated/audited model
+visibility, provider-neutral replay, or recovery behavior. For ordinary agent
+applications, a graph runtime may be sufficient and more convenient; for a
+runtime or platform that wants to own these semantics, Raygent keeps them as
+kernel facts.
+
 ## Factory-First Embedding
 
 Most embedders should start with the SDK factory:
